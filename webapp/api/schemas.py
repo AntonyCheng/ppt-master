@@ -73,15 +73,30 @@ class ProjectOut(BaseModel):
     updated_at: datetime
 
 
+class TemplateOut(BaseModel):
+    id: UUID
+    name: str
+    original_filename: str
+    status: str
+    page_count: int | None
+    metadata: dict
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
 class JobCreateIn(BaseModel):
     prompt: str = Field(min_length=1, max_length=20_000)
     model: str | None = Field(default=None, max_length=255)
+    template_id: UUID | None = None
 
 
 class JobOut(BaseModel):
     id: UUID
     project_id: UUID
     base_job_id: UUID | None
+    template_id: UUID | None
+    template_name: str | None
     status: JobStatus
     prompt: str
     model: str | None

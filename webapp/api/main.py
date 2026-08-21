@@ -8,13 +8,14 @@ import logging
 import re
 import shutil
 import xml.etree.ElementTree as ET
+import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,6 +38,8 @@ from .models import (
     Provider,
     ProviderModel,
     SystemSetting,
+    Template,
+    TemplateStatus,
     User,
     UserRole,
 )
@@ -63,6 +66,7 @@ from .schemas import (
     ProviderUpdateIn,
     ProjectCreateIn,
     ProjectOut,
+    TemplateOut,
     RegisterIn,
     UserOut,
 )
@@ -91,6 +95,30 @@ def _workspace_path(project: Project) -> Path:
     if root not in path.parents:
         raise RuntimeError("Project workspace is outside WORKSPACE_ROOT")
     return path
+
+
+def _template_workspace_path(template: Template) -> Path:
+    """Resolve a template workspace below the configured user data root."""
+
+    root = settings.workspace_root.resolve()
+    path = (root / template.workspace_relpath).resolve()
+    if root not in path.parents:
+        raise RuntimeError("Template workspace is outside WORKSPACE_ROOT")
+    return path
+
+
+def _template_out(template: Template) -> TemplateOut:
+    return TemplateOut(
+        id=template.id,
+        name=template.name,
+        original_filename=template.original_filename,
+        status=template.status,
+        page_count=template.page_count,
+        metadata=template.meta or {},
+        error=template.error,
+        created_at=template.created_at,
+        updated_at=template.updated_at,
+    )
 
 
 def _editor_artifact_path(project: Project, artifact: Artifact) -> Path:
@@ -265,6 +293,8 @@ def _job_out(job: Job) -> JobOut:
         id=job.id,
         project_id=job.project_id,
         base_job_id=job.base_job_id,
+        template_id=job.template_id,
+        template_name=job.template_name,
         status=job.status,
         prompt=job.prompt,
         model=job.model,
@@ -770,6 +800,162 @@ async def create_project(
     return _project_out(project)
 
 
+@app.get("/api/v1/templates", response_model=list[TemplateOut])
+async def list_templates(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[TemplateOut]:
+    """List the authenticated user's imported templates."""
+
+    templates = (
+        await db.execute(
+            select(Template).where(Template.owner_id == user.id).order_by(Template.updated_at.desc())
+        )
+    ).scalars().all()
+    return [_template_out(template) for template in templates]
+
+
+@app.post("/api/v1/templates/import", response_model=TemplateOut, status_code=status.HTTP_202_ACCEPTED)
+async def import_template(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TemplateOut:
+    """Store one PPTX and queue deterministic template analysis."""
+
+    original_filename = Path(file.filename or "uploaded.pptx").name
+    if not original_filename.lower().endswith(".pptx"):
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "模板文件必须是 .pptx 格式")
+    template = Template(
+        owner_id=user.id,
+        name=Path(original_filename).stem[:160] or "未命名模板",
+        original_filename=original_filename[:255],
+        workspace_relpath="pending",
+        status=TemplateStatus.ANALYZING.value,
+        meta={},
+    )
+    db.add(template)
+    await db.flush()
+    template.workspace_relpath = f"{user.id}/templates/{template.id}"
+    workspace = _template_workspace_path(template)
+    workspace.mkdir(parents=True, exist_ok=False)
+    source = workspace / "source.pptx"
+    max_bytes = 100 * 1024 * 1024
+    total = 0
+    try:
+        with source.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "模板文件不能超过 100 MB")
+                output.write(chunk)
+    except Exception:
+        shutil.rmtree(workspace, ignore_errors=True)
+        raise
+    finally:
+        await file.close()
+    try:
+        with zipfile.ZipFile(source) as archive:
+            names = set(archive.namelist())
+            if "[Content_Types].xml" not in names or "ppt/presentation.xml" not in names:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "上传文件不是有效的 PPTX 演示文稿")
+    except (zipfile.BadZipFile, OSError) as exc:
+        shutil.rmtree(workspace, ignore_errors=True)
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "上传文件不是有效的 PPTX 演示文稿") from exc
+    await db.commit()
+    await db.refresh(template)
+    from runner.celery_app import celery_app
+
+    celery_app.send_task("runner.import_template", args=[str(template.id)])
+    return _template_out(template)
+
+
+async def _get_owned_template(template_id: UUID, user: User, db: AsyncSession) -> Template:
+    template = (
+        await db.execute(select(Template).where(Template.id == template_id, Template.owner_id == user.id))
+    ).scalar_one_or_none()
+    if not template:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板不存在")
+    return template
+
+
+@app.get("/api/v1/templates/{template_id}/files/{file_path:path}")
+async def download_template_file(
+    template_id: UUID,
+    file_path: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve a preview or source file from an owned import workspace."""
+
+    template = await _get_owned_template(template_id, user, db)
+    root = _template_workspace_path(template)
+    path = (root / file_path).resolve()
+    if root not in path.parents or not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "模板文件不存在")
+    media_type = "image/svg+xml" if path.suffix.lower() == ".svg" else None
+    return FileResponse(path, media_type=media_type)
+
+
+@app.post("/api/v1/templates/{template_id}/retry", response_model=TemplateOut, status_code=status.HTTP_202_ACCEPTED)
+async def retry_template_import(
+    template_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TemplateOut:
+    """Requeue an interrupted template import and reset its visible progress."""
+
+    template = await _get_owned_template(template_id, user, db)
+    metadata = dict(template.meta or {})
+    metadata["progress"] = {
+        "stage": "queued",
+        "message": "已重新加入模板解析队列",
+        "logs": ["用户请求重新分析模板"],
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    template.meta = metadata
+    template.status = TemplateStatus.ANALYZING.value
+    template.error = None
+    await db.commit()
+    await db.refresh(template)
+    from runner.celery_app import celery_app
+
+    celery_app.send_task("runner.import_template", args=[str(template.id)])
+    return _template_out(template)
+
+
+@app.delete("/api/v1/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_template(
+    template_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Delete one owned template and its imported files."""
+
+    template = await _get_owned_template(template_id, user, db)
+    active_job = (
+        await db.execute(
+            select(Job.id)
+            .join(Project)
+            .where(
+                Project.owner_id == user.id,
+                Job.template_id == template.id,
+                Job.status.in_([JobStatus.QUEUED, JobStatus.RUNNING]),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if active_job:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "该模板正被任务使用，任务结束后才能删除。",
+        )
+    workspace = _template_workspace_path(template)
+    await db.delete(template)
+    await db.commit()
+    shutil.rmtree(workspace, ignore_errors=True)
+
+
 @app.get("/api/v1/projects/{project_id}", response_model=ProjectOut)
 async def get_project(project: Project = Depends(get_owned_project)) -> ProjectOut:
     """Return a project owned by the authenticated user."""
@@ -868,9 +1054,35 @@ async def create_job(
             .limit(1)
         )
     ).scalar_one_or_none()
+    template: Template | None = None
+    template_root: str | None = None
+    if payload.template_id:
+        if base_job:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "模板只能在新建演示文稿时选择。",
+            )
+        template = (
+            await db.execute(
+                select(Template).where(
+                    Template.id == payload.template_id,
+                    Template.owner_id == user.id,
+                    Template.status == TemplateStatus.READY.value,
+                )
+            )
+        ).scalar_one_or_none()
+        if not template:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "所选模板不存在或尚未准备完成。")
+        template_root = str((template.meta or {}).get("template_root") or "").strip()
+        if not template_root:
+            raise HTTPException(status.HTTP_409_CONFLICT, "所选模板缺少可用的模板工作区。")
     job = Job(
         project_id=locked_project.id,
         base_job_id=base_job.id if base_job else None,
+        template_id=template.id if template else None,
+        template_name=template.name if template else None,
+        template_workspace_relpath=template.workspace_relpath if template else None,
+        template_root=template_root,
         submitted_by=user.id,
         prompt=payload.prompt.strip(),
         model=model,

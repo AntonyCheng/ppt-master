@@ -29,6 +29,8 @@ from api.models import (
     Project,
     Provider,
     ProviderModel,
+    Template,
+    TemplateStatus,
     User,
 )
 from api.provider_config import opencode_config
@@ -65,6 +67,20 @@ def _host_job_workspace_path(project: Project, job: Job) -> str:
     return _host_bind_source(_host_workspace_path(project), f"jobs/{job.id}")
 
 
+def _host_template_workspace_path(template: Template) -> str:
+    """Resolve the Docker-host bind source for one template workspace."""
+
+    return _host_bind_source(settings.host_projects_root, template.workspace_relpath)
+
+
+def _template_workspace_path(template: Template) -> Path:
+    root = settings.workspace_root.resolve()
+    path = (root / template.workspace_relpath).resolve()
+    if root not in path.parents:
+        raise RuntimeError("Template workspace is outside WORKSPACE_ROOT")
+    return path
+
+
 def _project_workspace_path(project: Project) -> Path:
     """Resolve the runner-visible workspace used to discover output artifacts."""
 
@@ -93,6 +109,44 @@ def _job_workspace_path_by_id(project: Project, job_id: UUID) -> Path:
     if project_root not in path.parents:
         raise RuntimeError("Base job workspace is outside the project workspace")
     return path
+
+
+def _template_snapshot_source_path(job: Job) -> Path:
+    """Resolve the immutable template source recorded when a job was created."""
+
+    relpath = (job.template_workspace_relpath or "").replace("\\", "/")
+    root_name = (job.template_root or "").replace("\\", "/")
+    workspace_relative = PurePosixPath(relpath)
+    template_relative = PurePosixPath(root_name)
+    if (
+        not relpath
+        or not root_name
+        or workspace_relative.is_absolute()
+        or template_relative.is_absolute()
+        or ".." in workspace_relative.parts
+        or ".." in template_relative.parts
+    ):
+        raise RuntimeError("Job template snapshot is invalid")
+    workspace_root = settings.workspace_root.resolve()
+    template_path = (workspace_root / workspace_relative / template_relative).resolve()
+    if workspace_root not in template_path.parents:
+        raise RuntimeError("Job template snapshot is outside WORKSPACE_ROOT")
+    return template_path
+
+
+def _copy_template_snapshot(job: Job, destination: Path) -> Path | None:
+    """Copy an optional selected template into the isolated job workspace."""
+
+    if not job.template_name:
+        return None
+    source = _template_snapshot_source_path(job)
+    if not (source / "templates" / "design_spec.md").is_file():
+        raise RuntimeError("Selected template workspace is unavailable")
+    if any(item.is_symlink() for item in source.rglob("*")):
+        raise RuntimeError("Selected template contains unsupported symlinks")
+    target = destination / "template"
+    shutil.copytree(source, target)
+    return target
 
 
 def _prepare_job_workspace(project: Project, job: Job) -> Path:
@@ -394,8 +448,9 @@ def execute_job(self, job_id_text: str) -> None:
     worker_error: str | None = None
     try:
         job_workspace = _prepare_job_workspace(project, job)
+        template_workspace = _copy_template_snapshot(job, job_workspace)
         is_continuation = _seed_job_workspace(project, job, job_workspace)
-        if is_continuation:
+        if is_continuation or template_workspace:
             _grant_worker_write_access(job_workspace)
         mounts = [
             docker.types.Mount(
@@ -422,6 +477,8 @@ def execute_job(self, job_id_text: str) -> None:
             "PPTMASTER_OPENCODE_IDLE_TIMEOUT_SECONDS": str(settings.opencode_idle_timeout_seconds),
             **_provider_environment(),
         }
+        if template_workspace:
+            environment["PPTMASTER_TEMPLATE_ROOT"] = "/workspace/project/template"
         if generated_config:
             environment["PPTMASTER_OPENCODE_CONFIG_JSON"] = generated_config
         container = client.containers.run(
@@ -475,6 +532,179 @@ def execute_job(self, job_id_text: str) -> None:
         logger.exception("Job %s failed", job.id)
         _finish_job(job.id, succeeded=False, error=str(exc))
         raise
+    finally:
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except docker.errors.APIError:
+                pass
+
+
+@celery_app.task(name="runner.import_template")
+def import_template(template_id_text: str) -> None:
+    """Parse an uploaded PPTX into a deterministic Deck template workspace."""
+
+    template_id = UUID(template_id_text)
+
+    def clean_error(value: str) -> str:
+        """Keep worker progress envelopes out of the user-visible error field."""
+
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        meaningful = [line for line in lines if not line.startswith('{"type":')]
+        return (meaningful[-1] if meaningful else (lines[-1] if lines else "模板解析失败"))[-3000:]
+
+    def update_progress(
+        *,
+        stage: str,
+        message: str,
+        log_line: str | None = None,
+    ) -> None:
+        """Persist bounded import progress so the UI can explain long-running work."""
+
+        with SessionLocal() as progress_db:
+            current = progress_db.get(Template, template_id)
+            if not current:
+                return
+            metadata = dict(current.meta or {})
+            progress = dict(metadata.get("progress") or {})
+            logs = list(progress.get("logs") or [])
+            entry = log_line or message
+            if entry and (not logs or logs[-1] != entry):
+                logs.append(entry[-1000:])
+            progress.update(
+                {
+                    "stage": stage,
+                    "message": message,
+                    "logs": logs[-120:],
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            metadata["progress"] = progress
+            current.meta = metadata
+            progress_db.commit()
+
+    with SessionLocal() as db:
+        template = db.get(Template, template_id)
+        if not template:
+            return
+        template.status = TemplateStatus.ANALYZING.value
+        template.error = None
+        metadata = dict(template.meta or {})
+        metadata["progress"] = {
+            "stage": "starting",
+            "message": "正在启动模板解析容器",
+            "logs": ["任务已进入模板解析队列"],
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        template.meta = metadata
+        db.commit()
+    update_progress(stage="starting", message="正在启动模板解析容器")
+    container = None
+    try:
+        client = docker.from_env()
+        update_progress(stage="starting", message="正在准备模板工作区")
+        _grant_worker_write_access(_template_workspace_path(template))
+        host_workspace = _host_template_workspace_path(template)
+        container = client.containers.run(
+            settings.worker_image,
+            command=["python", "-m", "worker.template_import"],
+            name=f"pptmaster-template-{str(template_id)[:12]}",
+            detach=True,
+            auto_remove=False,
+            network=settings.worker_network,
+            user=f"{settings.worker_uid}:{settings.worker_gid}",
+            mounts=[docker.types.Mount(target="/workspace/template", source=host_workspace, type="bind")],
+            mem_limit="4g",
+            nano_cpus=2_000_000_000,
+            pids_limit=512,
+            security_opt=["no-new-privileges:true"],
+            read_only=True,
+            tmpfs={
+                "/home/pptmaster": (
+                    "rw,nosuid,size=256m,"
+                    f"uid={settings.worker_uid},gid={settings.worker_gid},mode=0755"
+                ),
+                "/tmp": "rw,noexec,nosuid,size=1g",
+            },
+            environment={"PPTMASTER_TEMPLATE_ID": str(template_id)},
+            labels={"app": "pptmaster", "template_id": str(template_id)},
+        )
+        update_progress(stage="running", message="解析容器已启动，正在读取 PPTX 结构")
+        output_lines: list[str] = []
+        for raw in container.logs(stream=True, follow=True):
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            output_lines.append(line)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                update_progress(stage="running", message=line[:240], log_line=line)
+                continue
+            if event.get("type") == "progress":
+                update_progress(
+                    stage=str(event.get("stage") or "running"),
+                    message=str(event.get("message") or "正在分析模板"),
+                    log_line=str(event.get("message") or ""),
+                )
+            elif event.get("type") == "log":
+                update_progress(
+                    stage="running",
+                    message=str(event.get("message") or "正在分析模板")[:240],
+                    log_line=str(event.get("message") or ""),
+                )
+        result = container.wait()
+        output = "\n".join(output_lines)
+        if result.get("StatusCode") != 0:
+            raise RuntimeError(clean_error(output))
+        summary_event = next(
+            (json.loads(line) for line in reversed(output_lines) if line.startswith("{") and json.loads(line).get("type") == "result"),
+            None,
+        )
+        summary = (summary_event or {}).get("summary") or {}
+        if not summary:
+            raise RuntimeError("模板解析完成但没有返回结果")
+        update_progress(stage="completed", message="模板解析完成，正在保存可用模板")
+        with SessionLocal() as db:
+            refreshed = db.get(Template, template_id)
+            if not refreshed:
+                return
+            refreshed.status = TemplateStatus.READY.value
+            refreshed.page_count = int(summary.get("page_count") or 0) or None
+            metadata = dict(refreshed.meta or {})
+            metadata.update(summary)
+            progress = dict(metadata.get("progress") or {})
+            progress.update(
+                {
+                    "stage": "completed",
+                    "message": "模板解析完成",
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            metadata["progress"] = progress
+            refreshed.meta = metadata
+            db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Template import failed for %s", template_id)
+        failure_message = clean_error(str(exc))
+        with SessionLocal() as db:
+            refreshed = db.get(Template, template_id)
+            if refreshed:
+                refreshed.status = TemplateStatus.FAILED.value
+                refreshed.error = failure_message
+                metadata = dict(refreshed.meta or {})
+                progress = dict(metadata.get("progress") or {})
+                progress.update(
+                    {
+                        "stage": "failed",
+                        "message": "模板解析失败",
+                        "logs": list(progress.get("logs") or [])[-119:] + [failure_message],
+                        "updated_at": datetime.now(UTC).isoformat(),
+                    }
+                )
+                metadata["progress"] = progress
+                refreshed.meta = metadata
+                db.commit()
     finally:
         if container is not None:
             try:

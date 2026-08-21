@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, KeyboardEvent, UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PresentationEditor } from "./PresentationEditor";
 import {
   Bot,
@@ -13,6 +13,7 @@ import {
   Download,
   Eye,
   FileText,
+  LayoutTemplate,
   LoaderCircle,
   LogIn,
   LogOut,
@@ -46,10 +47,14 @@ type ModelCatalogEntry = {
   is_default: boolean;
 };
 type Project = { id: string; title: string; created_at: string; updated_at: string };
+type TemplateProgress = { stage?: string; message?: string; logs?: string[]; updated_at?: string };
+type Template = { id: string; name: string; original_filename: string; status: "analyzing" | "ready" | "failed"; page_count: number | null; metadata: Record<string, unknown>; error: string | null; created_at: string; updated_at: string };
 type Job = {
   id: string;
   project_id: string;
   base_job_id: string | null;
+  template_id: string | null;
+  template_name: string | null;
   status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   prompt: string;
   model: string | null;
@@ -76,6 +81,11 @@ type PreviewState = {
   slides: Artifact[];
   index: number;
 };
+type TemplatePreviewState = {
+  template: Template;
+  slides: string[];
+  index: number;
+};
 type ProjectTooltip = { projectId: string; title: string; top: number; left: number };
 type ManagedDeletion =
   | { kind: "provider"; provider: Provider }
@@ -96,6 +106,8 @@ const phaseText: Record<string, string> = {
   succeeded: "已完成",
   failed: "执行失败",
 };
+
+const templateStatusText: Record<Template["status"], string> = { analyzing: "分析中", ready: "可用", failed: "导入失败" };
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -125,6 +137,7 @@ function eventText(event: JobEvent): string {
   if (event.event_type === "artifact") return `已生成 ${String(payload.path || "产物")}`;
   if (event.event_type === "error") return String(payload.message || "执行失败");
   if (event.event_type === "permission") return `权限提示：${String(payload.message || "访问被拒绝")}`;
+  if (event.event_type === "template") return String(payload.message || "正在应用所选模板");
   if (event.event_type === "validation") {
     return String(payload.message || `${payload.continuation === true ? "修改" : "生成"}校验完成`);
   }
@@ -169,6 +182,7 @@ export function App() {
   const [pendingProjectDeletion, setPendingProjectDeletion] = useState<Project | null>(null);
   const [projectTooltip, setProjectTooltip] = useState<ProjectTooltip | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [templatePreview, setTemplatePreview] = useState<TemplatePreviewState | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"users" | "models">("users");
   const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
@@ -177,6 +191,12 @@ export function App() {
   const [showAddUser, setShowAddUser] = useState(false);
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
   const [pendingManagedDeletion, setPendingManagedDeletion] = useState<ManagedDeletion | null>(null);
+  const [templatesOpen, setTemplatesOpen] = useState(false);
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [templateUploading, setTemplateUploading] = useState(false);
+  const [expandedTemplateId, setExpandedTemplateId] = useState<string | null>(null);
+  const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const endOfConversationRef = useRef<HTMLDivElement | null>(null);
   const conversationScrollRef = useRef<HTMLDivElement | null>(null);
   const conversationFollowsLatestRef = useRef(true);
@@ -202,6 +222,11 @@ export function App() {
     setActiveModel(configured[0]?.id ?? null);
   }, []);
 
+  const loadTemplates = useCallback(async () => {
+    const next = await request<Template[]>("/api/v1/templates");
+    setTemplates(next);
+  }, []);
+
   const loadAdminSettings = useCallback(async () => {
     const [nextUsers, nextProviders, nextCatalog] = await Promise.all([
       request<AdminUser[]>("/api/v1/admin/users"),
@@ -212,6 +237,7 @@ export function App() {
   }, []);
 
   useEffect(() => { if (settingsOpen && user?.role === "admin") void loadAdminSettings().catch((error) => setMessage(error instanceof Error ? error.message : "加载系统设置失败")); }, [loadAdminSettings, settingsOpen, user?.role]);
+  useEffect(() => { if (templatesOpen) { void loadTemplates().catch((error) => setMessage(error instanceof Error ? error.message : "加载模板库失败")); const timer = window.setInterval(() => void loadTemplates(), 4000); return () => window.clearInterval(timer); } }, [loadTemplates, templatesOpen]);
 
   const loadArtifacts = useCallback(async (projectId: string, jobId: string) => {
     setArtifacts(await request<Artifact[]>(`/api/v1/projects/${projectId}/jobs/${jobId}/artifacts`));
@@ -221,7 +247,7 @@ export function App() {
     request<User>("/api/v1/auth/me")
       .then(async (currentUser) => {
         setUser(currentUser);
-        await Promise.all([loadProjects(), loadActiveModel()]);
+        await Promise.all([loadProjects(), loadActiveModel(), loadTemplates()]);
       })
       .catch(() => undefined);
   }, [loadActiveModel, loadProjects]);
@@ -308,17 +334,24 @@ export function App() {
       .sort((left, right) => left.filename.localeCompare(right.filename, undefined, { numeric: true, sensitivity: "base" })),
     [uniqueArtifacts],
   );
+  const readyTemplates = useMemo(
+    () => templates.filter((template) => template.status === "ready"),
+    [templates],
+  );
+  const selectedTemplate = readyTemplates.find((template) => template.id === selectedTemplateId) ?? null;
 
   useEffect(() => {
-    if (!preview) return;
+    if (!preview && !templatePreview) return;
     function handlePreviewKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") setPreview(null);
+      if (event.key === "Escape") { setPreview(null); setTemplatePreview(null); }
       if (event.key === "ArrowLeft") setPreview((current) => current ? { ...current, index: Math.max(0, current.index - 1) } : current);
       if (event.key === "ArrowRight") setPreview((current) => current ? { ...current, index: Math.min(current.slides.length - 1, current.index + 1) } : current);
+      if (event.key === "ArrowLeft") setTemplatePreview((current) => current ? { ...current, index: Math.max(0, current.index - 1) } : current);
+      if (event.key === "ArrowRight") setTemplatePreview((current) => current ? { ...current, index: Math.min(current.slides.length - 1, current.index + 1) } : current);
     }
     window.addEventListener("keydown", handlePreviewKeyDown);
     return () => window.removeEventListener("keydown", handlePreviewKeyDown);
-  }, [preview]);
+  }, [preview, templatePreview]);
 
   useEffect(() => {
     conversationFollowsLatestRef.current = true;
@@ -356,7 +389,7 @@ export function App() {
         method: "POST",
         body: JSON.stringify({ username, password }),
       }));
-      await Promise.all([loadProjects(), loadActiveModel()]);
+      await Promise.all([loadProjects(), loadActiveModel(), loadTemplates()]);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "请求失败，请稍后重试。");
     }
@@ -411,10 +444,19 @@ export function App() {
     setPreview({ download, slides, index: 0 });
   }
 
+  function openTemplatePreview(template: Template) {
+    const slides = Array.isArray(template.metadata.preview_files)
+      ? template.metadata.preview_files.map(String).filter(Boolean)
+      : [];
+    if (slides.length > 0) setTemplatePreview({ template, slides, index: 0 });
+  }
+
   function startNewConversation() {
     setActiveProjectId(null);
     setActiveJobId(null);
     setPrompt("");
+    setSelectedTemplateId(null);
+    setTemplatePickerOpen(false);
     setMessage("");
     setSidebarOpen(false);
   }
@@ -448,12 +490,14 @@ export function App() {
       }
       const job = await request<Job>(`/api/v1/projects/${projectId}/jobs`, {
         method: "POST",
-      body: JSON.stringify({ prompt: text }),
+        body: JSON.stringify({ prompt: text, template_id: activeProjectId ? null : selectedTemplateId }),
       });
       setJobs((current) => [job, ...current]);
       setActiveJobId(job.id);
       setShowExecution(true);
       setPrompt("");
+      setSelectedTemplateId(null);
+      setTemplatePickerOpen(false);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "创建生成任务失败。");
     } finally {
@@ -589,6 +633,49 @@ export function App() {
     } catch (error) { setMessage(error instanceof Error ? error.message : "删除失败"); }
   }
 
+  async function uploadTemplate(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".pptx")) {
+      setMessage("请选择 .pptx 格式的演示文稿。");
+      return;
+    }
+    setTemplateUploading(true);
+    setMessage("");
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      const response = await fetch("/api/v1/templates/import", { method: "POST", credentials: "include", body });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(detail.detail || "模板上传失败，请稍后重试。");
+      }
+      const template = await response.json() as Template;
+      setTemplates((current) => [template, ...current]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "模板上传失败，请稍后重试。");
+    } finally {
+      setTemplateUploading(false);
+    }
+  }
+
+  async function deleteTemplate(template: Template) {
+    try {
+      await request<void>(`/api/v1/templates/${template.id}`, { method: "DELETE" });
+      setTemplates((current) => current.filter((item) => item.id !== template.id));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "删除模板失败");
+    }
+  }
+
+  async function retryTemplate(template: Template) {
+    try {
+      const next = await request<Template>(`/api/v1/templates/${template.id}/retry`, { method: "POST" });
+      setTemplates((current) => current.map((item) => item.id === next.id ? next : item));
+    } catch (error) { setMessage(error instanceof Error ? error.message : "重新分析失败"); }
+  }
+
   if (!user) {
     return (
       <main className="shell">
@@ -622,6 +709,13 @@ export function App() {
         rows={compact ? 2 : 4}
         disabled={isConversationBusy}
       />
+      {!activeProjectId && !isConversationBusy && <div className="composer-template-control">
+        <button className={`template-select-trigger ${selectedTemplate ? "selected" : ""}`} type="button" aria-expanded={templatePickerOpen} aria-haspopup="dialog" onClick={() => { void loadTemplates().catch((error) => setMessage(error instanceof Error ? error.message : "加载模板库失败")); setTemplatePickerOpen(true); }}>
+          <LayoutTemplate size={15} aria-hidden="true" />
+          <span>{selectedTemplate ? `已选：${selectedTemplate.name}` : "自由创作"}</span>
+        </button>
+        {selectedTemplate && <button className="template-clear-button" type="button" title="取消所选模板" aria-label="取消所选模板" onClick={() => setSelectedTemplateId(null)}><X size={14} /></button>}
+      </div>}
       <div className="composer-actions">
         {isConversationBusy ? (
           <button className="cancel-job-button" type="button" onClick={() => void cancelRunningJob()} disabled={!runningJob || runningJob.cancellation_requested} title="中止当前任务">
@@ -671,7 +765,7 @@ export function App() {
   );
 
   return (
-    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${sidebarOpen ? "sidebar-open" : ""} ${settingsOpen ? "settings-open" : ""}`}>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${sidebarOpen ? "sidebar-open" : ""} ${settingsOpen || templatesOpen ? "settings-open" : ""}`}>
       <button className="mobile-sidebar-toggle" type="button" aria-label="打开历史记录" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button>
       <aside className="sidebar" aria-label="历史对话">
         <div className="sidebar-top">
@@ -683,6 +777,7 @@ export function App() {
             <button className="icon-button mobile-sidebar-close" type="button" aria-label="关闭历史记录" onClick={() => setSidebarOpen(false)}><X size={18} /></button>
           </div>
           <button className="new-chat-button" type="button" onClick={startNewConversation} title="新建对话"><Plus size={17} /><span>新建对话</span></button>
+          <button className="template-library-button" type="button" onClick={() => { setSettingsOpen(false); setTemplatesOpen(true); }} title="模板库"><LayoutTemplate size={17} /><span>模板库</span></button>
         </div>
         <nav className="project-list" aria-label="项目列表">
           <p className="sidebar-section-title">历史记录</p>
@@ -710,7 +805,23 @@ export function App() {
       {projectTooltip && <div className="project-title-tooltip" role="tooltip" style={{ left: projectTooltip.left, top: projectTooltip.top }}>{projectTooltip.title}</div>}
       {sidebarOpen && <button className="sidebar-scrim" type="button" aria-label="关闭历史记录" onClick={() => setSidebarOpen(false)} />}
       <main className="workspace">
-        {settingsOpen ? <section className="settings-page">
+        {templatesOpen ? <section className="settings-page template-library-page">
+          <header className="settings-header"><div><p>个人资源</p><h1>模板库</h1></div><button className="icon-button settings-close" type="button" title="返回工作台" aria-label="返回工作台" onClick={() => setTemplatesOpen(false)}><X size={18} /></button></header>
+          <section className="settings-section template-upload-section"><div className="settings-section-head"><div><h2>导入演示文稿</h2><p>上传 PPTX 后，系统会提取版式、母版、配色和文本结构，生成可直接使用的个人模板。</p></div><label className={`command-button template-upload-button ${templateUploading ? "is-uploading" : ""}`}><input type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" onChange={uploadTemplate} disabled={templateUploading} />{templateUploading ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}{templateUploading ? "正在上传" : "上传 PPTX"}</label></div></section>
+          {message && <p className="message">{message}</p>}
+          <section className="template-grid" aria-label="已导入模板">{templates.map((template) => {
+            const preview = Array.isArray(template.metadata.preview_files) ? String(template.metadata.preview_files[0] || "") : "";
+            const progress = (template.metadata.progress || {}) as TemplateProgress;
+            const expanded = expandedTemplateId === template.id;
+            return <article className="template-card" key={template.id}>
+              {preview ? <button className="template-preview-cover" type="button" onClick={() => openTemplatePreview(template)} aria-label={`预览模板 ${template.name}`}><img src={`/api/v1/templates/${template.id}/files/${preview}`} alt={`${template.name}预览`} /></button> : <div className="template-placeholder"><LayoutTemplate size={25} /></div>}
+              <div className="template-card-body"><div><h2>{template.name}</h2><p>{template.page_count ? `${template.page_count} 页` : template.status === "analyzing" ? "正在读取页面信息" : "未生成页面摘要"}</p></div><span className={`template-status ${template.status}`}>{template.status === "analyzing" && <LoaderCircle className="spin" size={13} />}{templateStatusText[template.status]}</span></div>
+              <div className="template-progress-row"><span>{progress.message || (template.status === "failed" ? "导入失败" : "暂无导入详情")}</span><div className="template-card-actions">{preview && <button className="template-preview-button" type="button" onClick={() => openTemplatePreview(template)}><Eye size={14} />预览模板</button>}<button className="template-details-button" type="button" onClick={() => setExpandedTemplateId(expanded ? null : template.id)}>{expanded ? "收起详情" : "查看详情"}<ChevronDown className={expanded ? "rotate-180" : ""} size={14} /></button></div></div>
+              {expanded && <div className="template-progress-details"><div className="template-progress-stage">阶段：{progress.stage || "未知"}</div>{template.error && <p className="template-error">{template.error}</p>}<pre>{(progress.logs || []).join("\n") || "暂无日志"}</pre>{template.status === "failed" && <button className="secondary-button" type="button" onClick={() => void retryTemplate(template)}>重新分析</button>}</div>}
+              <footer><span>{template.original_filename}</span><button className="text-danger" type="button" onClick={() => void deleteTemplate(template)}>删除</button></footer>
+            </article>;
+          })}{templates.length === 0 && <div className="template-empty"><LayoutTemplate size={28} /><p>还没有模板。上传一份 PPTX 后，它会显示在这里。</p></div>}</section>
+        </section> : settingsOpen ? <section className="settings-page">
           <header className="settings-header"><div><p>管理员控制台</p><h1>系统设置</h1></div><button className="icon-button settings-close" type="button" title="返回工作台" aria-label="返回工作台" onClick={() => setSettingsOpen(false)}><X size={18} /></button></header>
           <nav className="settings-tabs" role="tablist" aria-label="系统设置分类"><button className={settingsTab === "users" ? "active" : ""} type="button" role="tab" aria-selected={settingsTab === "users"} onClick={() => setSettingsTab("users")}>用户管理</button><button className={settingsTab === "models" ? "active" : ""} type="button" role="tab" aria-selected={settingsTab === "models"} onClick={() => setSettingsTab("models")}>模型管理</button></nav>
           {message && <p className="message">{message}</p>}
@@ -763,6 +874,7 @@ export function App() {
                       <div className="assistant-content">
                         <div className="assistant-title-row"><p className="message-role">智创PPT专家</p><button className={`status-badge ${isFinalizing ? "finalizing" : job.status}`} type="button" onClick={() => setActiveJobId(job.id)}>{job.status === "failed" && <CircleAlert size={13} />}{job.status === "queued" && <Clock3 size={13} />}{isFinalizing ? "正在整理产物" : statusText[job.status]}</button></div>
                         {job.base_job_id && <p className="revision-note">基于上一版演示文稿继续修改</p>}
+                        {job.template_name && <p className="template-note"><LayoutTemplate size={14} aria-hidden="true" />使用模板：{job.template_name}</p>}
                         {job.error && <p className="job-error"><CircleAlert size={14} />{job.error}</p>}
                         {isSelected ? (
                           <>
@@ -804,6 +916,40 @@ export function App() {
       </div>}
         </>}
       </main>
+      {templatePickerOpen && <div className="preview-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setTemplatePickerOpen(false); }}>
+        <section className="settings-modal template-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="template-picker-title">
+          <header><div><p className="template-picker-kicker">新建演示文稿</p><h2 id="template-picker-title">选择模板</h2></div><button className="icon-button" type="button" title="关闭" aria-label="关闭" onClick={() => setTemplatePickerOpen(false)}><X size={18} /></button></header>
+          <p className="template-picker-intro">可直接自由创作，也可选用你的个人模板；模板会固定在本次生成任务中。</p>
+          <div className="template-picker-grid" role="list">
+            <button className={`template-choice template-choice-free ${selectedTemplateId === null ? "selected" : ""}`} type="button" role="listitem" aria-pressed={selectedTemplateId === null} onClick={() => { setSelectedTemplateId(null); setTemplatePickerOpen(false); }}><LayoutTemplate size={21} aria-hidden="true" /><strong>自由创作</strong><span>不使用模板</span></button>
+            {readyTemplates.map((template) => {
+              const preview = Array.isArray(template.metadata.preview_files) ? String(template.metadata.preview_files[0] || "") : "";
+              const selected = template.id === selectedTemplateId;
+              return <article className={`template-picker-card ${selected ? "selected" : ""}`} role="listitem" key={template.id}>
+                <button className="template-choice" type="button" aria-pressed={selected} onClick={() => { setSelectedTemplateId(template.id); setTemplatePickerOpen(false); }}>{preview ? <img src={`/api/v1/templates/${template.id}/files/${preview}`} alt="" /> : <div className="template-choice-placeholder"><LayoutTemplate size={21} /></div>}<span><strong>{template.name}</strong><small>{template.page_count ? `${template.page_count} 页` : "已完成解析"}</small></span></button>
+                <button className="template-picker-preview" type="button" title={`预览 ${template.name}`} aria-label={`预览 ${template.name}`} onClick={() => openTemplatePreview(template)}><Eye size={15} /><span>预览</span></button>
+              </article>;
+            })}
+          </div>
+          {readyTemplates.length === 0 && <p className="template-picker-empty">暂无可用模板。你可以先在模板库上传 PPTX，或直接自由创作。</p>}
+        </section>
+      </div>}
+      {templatePreview && <div className="preview-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setTemplatePreview(null); }}>
+        <section className="preview-dialog" role="dialog" aria-modal="true" aria-label={`${templatePreview.template.name}模板预览`}>
+          <header className="preview-header">
+            <div><p>模板预览</p><h2>{templatePreview.template.name}</h2></div>
+            <button className="icon-button preview-close" type="button" title="关闭预览" aria-label="关闭预览" onClick={() => setTemplatePreview(null)}><X size={19} /></button>
+          </header>
+          <div className="preview-body">
+            {templatePreview.slides.length > 1 && <div className="preview-thumbnails" aria-label="模板页面列表">{templatePreview.slides.map((slide, index) => <button className={`preview-thumbnail ${index === templatePreview.index ? "active" : ""}`} type="button" key={slide} onClick={() => setTemplatePreview((current) => current ? { ...current, index } : current)}><img src={`/api/v1/templates/${templatePreview.template.id}/files/${slide}`} alt={`第 ${index + 1} 页`} /><span>{index + 1}</span></button>)}</div>}
+            <div className="preview-canvas"><img src={`/api/v1/templates/${templatePreview.template.id}/files/${templatePreview.slides[templatePreview.index]}`} alt={`${templatePreview.template.name}第 ${templatePreview.index + 1} 页`} /></div>
+          </div>
+          <footer className="preview-footer">
+            <span>{templatePreview.slides.length > 1 ? `第 ${templatePreview.index + 1} / ${templatePreview.slides.length} 页` : "SVG 页面"}</span>
+            <div><button className="preview-nav" type="button" title="上一页" aria-label="上一页" disabled={templatePreview.index === 0} onClick={() => setTemplatePreview((current) => current ? { ...current, index: Math.max(0, current.index - 1) } : current)}><ChevronLeft size={17} /></button><button className="preview-nav" type="button" title="下一页" aria-label="下一页" disabled={templatePreview.index >= templatePreview.slides.length - 1} onClick={() => setTemplatePreview((current) => current ? { ...current, index: Math.min(current.slides.length - 1, current.index + 1) } : current)}><ChevronRight size={17} /></button><a className="preview-svg-download" href={`/api/v1/templates/${templatePreview.template.id}/files/${templatePreview.slides[templatePreview.index]}`} title="下载当前页 SVG" aria-label="下载当前页 SVG" download><Download size={16} /><span>下载当前页 SVG</span></a></div>
+          </footer>
+        </section>
+      </div>}
       {pendingProjectDeletion && <div className="preview-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setPendingProjectDeletion(null); }}>
         <section className="settings-modal deletion-modal project-delete-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-project-title">
           <header><h2 id="delete-project-title">确认删除对话</h2><button className="icon-button" type="button" aria-label="关闭" onClick={() => setPendingProjectDeletion(null)}><X size={18} /></button></header>

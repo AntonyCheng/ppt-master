@@ -370,6 +370,7 @@ def main() -> int:
         emit("error", message="PPTMASTER_JOB_ID and PPTMASTER_JOB_PROMPT are required")
         return 2
     continue_mode = os.environ.get("PPTMASTER_CONTINUE") == "1"
+    template_root = os.environ.get("PPTMASTER_TEMPLATE_ROOT", "").strip()
     project_workspace = job_project_workspace(job_id, continue_mode)
     baseline: dict[str, str] = {}
     emit("status", status="initializing")
@@ -401,6 +402,18 @@ def main() -> int:
             emit("error", message="Project workspace initialization failed")
             return 1
         workspace_instruction = "The Worker has already initialized the empty project workspace."
+    template_instruction = ""
+    if template_root:
+        selected_template = Path(template_root)
+        if not (selected_template / "templates" / "design_spec.md").is_file():
+            emit("error", message="Selected template workspace is unavailable")
+            return 1
+        emit("template", message="正在应用所选模板")
+        template_instruction = (
+            f"Use the selected PPT Master template workspace at {selected_template} as the exact "
+            "template workspace for this run. Read and apply it while generating. Do not modify, "
+            "move, or duplicate that template workspace."
+        )
     agent_prompt = f"""You are executing one autonomous PPT Master generation job.
 
 Read and follow /app/AGENTS.md and its referenced ppt-master Skill. The web request is
@@ -409,6 +422,7 @@ interactive confirmation gate. The only project workspace is {project_workspace}
 It is the immutable project root for this job. Do not run project_manager.py init, and do
 not move, rename, copy, or create another project directory. Author every project file
 directly beneath this exact path.
+{template_instruction}
 For continuation edits, modify the existing SVG authoring files directly and preserve all
 unaffected slides. Do not run sudo, inspect /proc, inspect host permissions, or probe the
 container environment; those checks are unrelated to the presentation edit. Create a

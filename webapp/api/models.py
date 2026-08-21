@@ -1,4 +1,4 @@
-"""Persistent domain models for accounts, projects, jobs, and artifacts."""
+"""Persistent domain models for accounts, projects, jobs, templates, and artifacts."""
 
 from __future__ import annotations
 
@@ -37,6 +37,14 @@ class ArtifactKind(str, enum.Enum):
     SVG = "svg"
     PPTX = "pptx"
     REPORT = "report"
+
+
+class TemplateStatus(str, enum.Enum):
+    """Lifecycle states for an uploaded personal PPTX template."""
+
+    ANALYZING = "analyzing"
+    READY = "ready"
+    FAILED = "failed"
 
 
 class User(Base):
@@ -107,6 +115,24 @@ class Project(Base):
     )
 
 
+class Template(Base):
+    """A user-owned PPTX template workspace."""
+
+    __tablename__ = "templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    original_filename: Mapped[str] = mapped_column(String(255))
+    workspace_relpath: Mapped[str] = mapped_column(String(512), unique=True)
+    status: Mapped[str] = mapped_column(String(32), default=TemplateStatus.ANALYZING.value, index=True)
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    meta: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class Job(Base):
     """A queued generation or re-export operation within a project."""
 
@@ -117,6 +143,12 @@ class Job(Base):
     base_job_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    template_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("templates.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    template_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    template_workspace_relpath: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    template_root: Mapped[str | None] = mapped_column(String(255), nullable=True)
     submitted_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     prompt: Mapped[str] = mapped_column(Text)
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
