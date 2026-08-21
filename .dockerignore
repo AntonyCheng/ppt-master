@@ -1,0 +1,15 @@
+.git
+.github
+.claude-plugin
+projects
+docker/data
+docker/.env
+docker/opencode
+webapp/data
+webapp/frontend/node_modules
+webapp/frontend/dist
+**/__pycache__
+**/*.py[cod]
+*.db
+*.sqlite*
+*.log

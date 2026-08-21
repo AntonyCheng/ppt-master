@@ -1,0 +1,14 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH=/opt/venv/bin:$PATH
+
+WORKDIR /app/webapp
+RUN python -m venv /opt/venv
+COPY webapp/requirements.txt /tmp/webapp-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/webapp-requirements.txt
+COPY webapp/api ./api
+COPY webapp/runner ./runner
+
+CMD ["celery", "-A", "runner.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]

@@ -1,0 +1,13 @@
+# Runtime dependencies for the multi-user web application.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+sqlalchemy>=2.0,<3
+asyncpg>=0.29,<1
+psycopg[binary]>=3.2,<4
+alembic>=1.13,<2
+celery[redis]>=5.4,<6
+cryptography>=44,<46
+docker>=7.1,<8
+pwdlib[argon2]>=0.2,<1
+pydantic-settings>=2.5,<3
+email-validator>=2.2,<3

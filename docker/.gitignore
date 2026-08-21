@@ -1,0 +1,11 @@
+# Compose bind-mount state
+data/*
+!data/.gitkeep
+
+# Deployment secrets
+.env
+
+# OpenCode provider configuration may contain API keys
+opencode/*
+!opencode/.gitkeep
+!opencode/opencode.jsonc.example
