@@ -6,7 +6,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BIGINT, JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -18,6 +18,7 @@ class UserRole(str, enum.Enum):
     """Roles available to authenticated users."""
 
     ADMIN = "admin"
+    SUPER_ADMIN = "super_admin"
     MEMBER = "member"
 
 
@@ -115,13 +116,83 @@ class Project(Base):
     )
 
 
+class ProjectMaterial(Base):
+    """A source file uploaded for one project generation workflow."""
+
+    __tablename__ = "project_materials"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    original_filename: Mapped[str] = mapped_column(String(255))
+    relative_path: Mapped[str] = mapped_column(String(1024))
+    content_type: Mapped[str] = mapped_column(String(255), default="application/octet-stream")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(32), default="ready", index=True)
+    meta: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ProjectCreativeState(Base):
+    """Persist the editable requirements, outline, and active creation stage."""
+
+    __tablename__ = "project_creative_states"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    stage: Mapped[str] = mapped_column(String(32), default="requirements", index=True)
+    requirements: Mapped[dict] = mapped_column(JSON, default=dict)
+    outline: Mapped[list] = mapped_column(JSON, default=list)
+    notes_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    selected_template_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("templates.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PageRefinementMessage(Base):
+    """One user or assistant message in a page-scoped refinement conversation."""
+
+    __tablename__ = "page_refinement_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    slide_number: Mapped[int] = mapped_column(Integer, index=True)
+    role: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str] = mapped_column(Text)
+    client_message_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    message_order: Mapped[int] = mapped_column(
+        BIGINT,
+        nullable=False,
+        server_default=text("nextval('page_refinement_messages_order_seq'::regclass)"),
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class Template(Base):
-    """A user-owned PPTX template workspace."""
+    """A user-owned or platform-managed PPTX template workspace."""
 
     __tablename__ = "templates"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    scope: Mapped[str] = mapped_column(String(16), default="user", index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
     name: Mapped[str] = mapped_column(String(160))
     original_filename: Mapped[str] = mapped_column(String(255))
     workspace_relpath: Mapped[str] = mapped_column(String(512), unique=True)
@@ -131,6 +202,30 @@ class Template(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class PromptSnippet(Base):
+    """Store one reusable personal or platform prompt."""
+
+    __tablename__ = "prompt_snippets"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    scope: Mapped[str] = mapped_column(String(16), default="user", index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    name: Mapped[str] = mapped_column(String(120))
+    content: Mapped[str] = mapped_column(Text)
+    category: Mapped[str] = mapped_column(String(64), default="个人")
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Job(Base):
@@ -143,6 +238,8 @@ class Job(Base):
     base_job_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Page-scoped refinement jobs must identify the only slide the worker may change.
+    target_slide_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     template_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("templates.id", ondelete="SET NULL"), nullable=True, index=True
     )

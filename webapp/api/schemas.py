@@ -73,6 +73,80 @@ class ProjectOut(BaseModel):
     updated_at: datetime
 
 
+class ProjectMaterialOut(BaseModel):
+    id: UUID
+    original_filename: str
+    content_type: str
+    size_bytes: int
+    status: str
+    metadata: dict
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectUpdateIn(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+
+
+class OutlineSlideIn(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    purpose: str = Field(default="", max_length=500)
+    kind: str = Field(default="内容页", max_length=64)
+    notes: str = Field(default="", max_length=2_000)
+
+
+class ProjectCreativeStateUpdateIn(BaseModel):
+    stage: str | None = Field(default=None, max_length=32)
+    requirements: dict | None = None
+    outline: list[OutlineSlideIn] | None = None
+    notes_enabled: bool | None = None
+    selected_template_id: UUID | None = None
+
+
+class ProjectCreativeOutlineIn(BaseModel):
+    """Request a fresh outline from the saved creative requirements."""
+
+    requirements: dict | None = None
+
+
+class ProjectCreativeStateOut(BaseModel):
+    project_id: UUID
+    stage: str
+    requirements: dict
+    outline: list[OutlineSlideIn]
+    notes_enabled: bool
+    selected_template_id: UUID | None
+    updated_at: datetime | None
+
+
+class PageRefinementMessageOut(BaseModel):
+    id: UUID
+    job_id: UUID | None
+    slide_number: int
+    role: str
+    content: str
+    message_order: int
+    created_at: datetime
+
+
+class PageRefinementIntentIn(BaseModel):
+    """Classify one page-scoped chat message before creating a PPT job."""
+
+    slide_number: int = Field(ge=1, le=999)
+    slide_title: str = Field(default="当前页面", min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=4_000)
+    client_message_id: str | None = Field(default=None, min_length=8, max_length=64)
+
+
+class PageRefinementIntentOut(BaseModel):
+    action: str
+    confidence: float = Field(ge=0, le=1)
+    normalized_request: str = ""
+    reply: str = ""
+    clarification_question: str = ""
+
+
 class TemplateOut(BaseModel):
     id: UUID
     name: str
@@ -83,18 +157,77 @@ class TemplateOut(BaseModel):
     error: str | None
     created_at: datetime
     updated_at: datetime
+    scope: str = "user"
+    is_active: bool = True
+    sort_order: int = 0
+
+
+class TemplateRenameIn(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+
+
+class AdminTemplateUpdateIn(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    is_active: bool | None = None
+    sort_order: int | None = None
+
+
+class PromptSnippetCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1, max_length=10_000)
+    category: str = Field(default="个人", min_length=1, max_length=64)
+
+
+class PromptSnippetUpdateIn(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    content: str | None = Field(default=None, min_length=1, max_length=10_000)
+    category: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class PromptSnippetOut(BaseModel):
+    id: UUID
+    name: str
+    content: str
+    category: str
+    used_count: int
+    created_at: datetime
+    updated_at: datetime
+    scope: str = "user"
+    is_active: bool = True
+    sort_order: int = 0
+
+
+class AdminPromptSnippetCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1, max_length=10_000)
+    category: str = Field(default="平台", min_length=1, max_length=64)
+    is_active: bool = True
+    sort_order: int = 0
+
+
+class AdminPromptSnippetUpdateIn(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    content: str | None = Field(default=None, min_length=1, max_length=10_000)
+    category: str | None = Field(default=None, min_length=1, max_length=64)
+    is_active: bool | None = None
+    sort_order: int | None = None
 
 
 class JobCreateIn(BaseModel):
     prompt: str = Field(min_length=1, max_length=20_000)
     model: str | None = Field(default=None, max_length=255)
     template_id: UUID | None = None
+    base_job_id: UUID | None = None
+    target_slide_number: int | None = Field(default=None, ge=1, le=999)
+    conversation_message: str | None = Field(default=None, min_length=1, max_length=4_000)
+    client_message_id: str | None = Field(default=None, min_length=8, max_length=64)
 
 
 class JobOut(BaseModel):
     id: UUID
     project_id: UUID
     base_job_id: UUID | None
+    target_slide_number: int | None
     template_id: UUID | None
     template_name: str | None
     status: JobStatus

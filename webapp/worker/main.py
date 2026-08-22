@@ -137,7 +137,12 @@ def _emit_command_line(line: str) -> None:
         return
     if event_type == "step_finish":
         tokens = part.get("tokens") or {}
-        emit("usage", tokens=tokens.get("total"), cost=part.get("cost"))
+        emit(
+            "usage",
+            tokens=tokens,
+            total_tokens=tokens.get("total"),
+            cost=part.get("cost"),
+        )
         return
     emit("opencode", event=event_type or "unknown")
 
@@ -253,7 +258,8 @@ def _snapshot(project_workspace: Path) -> dict[str, str]:
         if not root.is_dir():
             continue
         for path in sorted(root.glob(pattern)):
-            snapshot[str(path.relative_to(project_workspace))] = hashlib.sha256(path.read_bytes()).hexdigest()
+            # Keep manifest keys portable so local Windows checks match the Linux worker.
+            snapshot[path.relative_to(project_workspace).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
     return snapshot
 
 
@@ -302,11 +308,23 @@ def _replacement_requests(prompt: str) -> list[dict[str, object]]:
     return requests
 
 
+def _target_slide_number() -> int | None:
+    raw = os.environ.get("PPTMASTER_TARGET_SLIDE", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def _validate_revision(
     project_workspace: Path,
     baseline: dict[str, str],
     prompt: str,
     continue_mode: bool,
+    target_slide: int | None,
 ) -> dict[str, object]:
     """Verify that the generated or continued authoring output is deliverable."""
 
@@ -315,6 +333,17 @@ def _validate_revision(
         path for path in set(baseline) | set(current) if baseline.get(path) != current.get(path)
     )
     svg_paths = _slide_paths(project_workspace, None)
+    baseline_svg = {path for path in baseline if path.startswith("svg_output/")}
+    current_svg = {f"svg_output/{path.name}" for path in svg_paths}
+    target_svg = {
+        f"svg_output/{path.name}"
+        for path in _slide_paths(project_workspace, target_slide)
+    }
+    changed_svg_files = sorted(path for path in changed if path.startswith("svg_output/"))
+    unexpected_changed_slides = sorted(
+        path for path in changed_svg_files if target_slide is not None and path not in target_svg
+    )
+    target_changed = sorted(path for path in changed_svg_files if path in target_svg)
     replacements = _replacement_requests(prompt)
     checks: list[dict[str, object]] = []
     for request in replacements:
@@ -337,6 +366,9 @@ def _validate_revision(
     passed = bool(svg_paths) and changed_pptx
     if continue_mode:
         passed = passed and changed_svg
+        if target_slide is not None:
+            passed = passed and bool(target_svg) and bool(target_changed)
+            passed = passed and not unexpected_changed_slides and baseline_svg == current_svg
     if checks:
         passed = passed and all(bool(check["passed"]) for check in checks)
     validation_type = "修改" if continue_mode else "生成"
@@ -346,6 +378,10 @@ def _validate_revision(
         "changed_files": changed,
         "changed_svg": changed_svg,
         "changed_pptx": changed_pptx,
+        "target_slide_number": target_slide,
+        "changed_target_slides": target_changed,
+        "unexpected_changed_slides": unexpected_changed_slides,
+        "slide_roster_unchanged": baseline_svg == current_svg if continue_mode else True,
         "checks": checks,
         "message": (
             f"{validation_type}校验通过"
@@ -370,6 +406,7 @@ def main() -> int:
         emit("error", message="PPTMASTER_JOB_ID and PPTMASTER_JOB_PROMPT are required")
         return 2
     continue_mode = os.environ.get("PPTMASTER_CONTINUE") == "1"
+    target_slide = _target_slide_number()
     template_root = os.environ.get("PPTMASTER_TEMPLATE_ROOT", "").strip()
     project_workspace = job_project_workspace(job_id, continue_mode)
     baseline: dict[str, str] = {}
@@ -382,6 +419,9 @@ def main() -> int:
             return 1
         emit("status", status="continuing")
         baseline = _snapshot(project_workspace)
+        if target_slide is not None and not _slide_paths(project_workspace, target_slide):
+            emit("error", message=f"目标页面不存在：第 {target_slide} 页")
+            return 1
         workspace_instruction = (
             "The workspace contains the last successful revision. Modify that existing PPT Master "
             "project in place and preserve all unaffected slides."
@@ -424,7 +464,8 @@ not move, rename, copy, or create another project directory. Author every projec
 directly beneath this exact path.
 {template_instruction}
 For continuation edits, modify the existing SVG authoring files directly and preserve all
-unaffected slides. Do not run sudo, inspect /proc, inspect host permissions, or probe the
+unaffected slides. If a target slide is provided, only that slide's SVG may change; do not
+modify any other slide SVG, even if a broader redesign seems helpful. Do not run sudo, inspect /proc, inspect host permissions, or probe the
 container environment; those checks are unrelated to the presentation edit. Create a
 native editable PPTX, run the required quality checks, and export the final .pptx into
 {project_workspace}/exports. Do not access files outside /workspace/project except the installed
@@ -450,7 +491,7 @@ User request:
         emit("artifact", kind="svg", path=f"svg_output/{svg.name}")
     for pptx in sorted((project_workspace / "exports").glob("*.pptx")):
         emit("artifact", kind="pptx", path=f"exports/{pptx.name}")
-    validation = _validate_revision(project_workspace, baseline, prompt, continue_mode)
+    validation = _validate_revision(project_workspace, baseline, prompt, continue_mode, target_slide)
     emit("validation", **validation)
     if not validation["passed"]:
         emit("error", message=str(validation["message"]))

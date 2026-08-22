@@ -13,6 +13,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request as UrlRequest, urlopen
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, status
@@ -24,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .database import SessionLocal, get_db
-from .deps import get_current_user, get_owned_project, require_admin
+from .deps import get_current_user, get_owned_project, require_admin, require_super_admin
 from .models import (
     Artifact,
     ArtifactKind,
@@ -34,7 +36,11 @@ from .models import (
     JobEvent,
     JobStatus,
     ModelAccessPolicy,
+    PageRefinementMessage,
     Project,
+    ProjectMaterial,
+    ProjectCreativeState,
+    PromptSnippet,
     Provider,
     ProviderModel,
     SystemSetting,
@@ -47,6 +53,9 @@ from .schemas import (
     ArtifactOut,
     AdminUserCreateIn,
     AdminUserUpdateIn,
+    AdminPromptSnippetCreateIn,
+    AdminPromptSnippetUpdateIn,
+    AdminTemplateUpdateIn,
     EditorSlideOut,
     EditorSlideSaveIn,
     InviteIn,
@@ -58,6 +67,12 @@ from .schemas import (
     ModelCatalogDefaultIn,
     ModelCatalogOut,
     ModelOut,
+    PageRefinementIntentIn,
+    PageRefinementIntentOut,
+    PageRefinementMessageOut,
+    PromptSnippetCreateIn,
+    PromptSnippetOut,
+    PromptSnippetUpdateIn,
     ProviderIn,
     ProviderModelIn,
     ProviderModelOut,
@@ -65,8 +80,14 @@ from .schemas import (
     ProviderOut,
     ProviderUpdateIn,
     ProjectCreateIn,
+    ProjectCreativeOutlineIn,
+    ProjectCreativeStateOut,
+    ProjectCreativeStateUpdateIn,
     ProjectOut,
+    ProjectMaterialOut,
+    ProjectUpdateIn,
     TemplateOut,
+    TemplateRenameIn,
     RegisterIn,
     UserOut,
 )
@@ -80,7 +101,7 @@ from .security import (
     token_hash,
     verify_password,
 )
-from .provider_config import encrypt_api_key, key_hint
+from .provider_config import decrypt_api_key, encrypt_api_key, key_hint
 
 settings = get_settings()
 FRONTEND_DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
@@ -118,6 +139,26 @@ def _template_out(template: Template) -> TemplateOut:
         error=template.error,
         created_at=template.created_at,
         updated_at=template.updated_at,
+        scope=template.scope,
+        is_active=template.is_active,
+        sort_order=template.sort_order,
+    )
+
+
+def _prompt_snippet_out(snippet: PromptSnippet) -> PromptSnippetOut:
+    """Convert one saved prompt into the public API representation."""
+
+    return PromptSnippetOut(
+        id=snippet.id,
+        name=snippet.name,
+        content=snippet.content,
+        category=snippet.category,
+        used_count=snippet.used_count,
+        created_at=snippet.created_at,
+        updated_at=snippet.updated_at,
+        scope=snippet.scope,
+        is_active=snippet.is_active,
+        sort_order=snippet.sort_order,
     )
 
 
@@ -164,6 +205,348 @@ def _user_out(user: User) -> UserOut:
         is_active=user.is_active,
         deletion_pending=user.deletion_requested_at is not None,
     )
+
+
+def _creative_state_out(state: ProjectCreativeState) -> ProjectCreativeStateOut:
+    """Convert one persisted creative workspace into its public shape."""
+
+    return ProjectCreativeStateOut(
+        project_id=state.project_id,
+        stage=state.stage,
+        requirements=state.requirements or {},
+        outline=state.outline or [],
+        notes_enabled=state.notes_enabled,
+        selected_template_id=state.selected_template_id,
+        updated_at=state.updated_at,
+    )
+
+
+def _outline_prompt(prompt: str, state: ProjectCreativeState | None) -> str:
+    """Append a confirmed project outline to a first-generation instruction."""
+
+    if state is None or not state.outline:
+        return prompt
+    requirements = state.requirements or {}
+    lines = [prompt, "", "已确认的演示结构（必须遵循页面顺序并保留每页目标）："]
+    for index, slide in enumerate(state.outline, start=1):
+        if not isinstance(slide, dict):
+            continue
+        title = str(slide.get("title") or f"第 {index} 页").strip()
+        purpose = str(slide.get("purpose") or "").strip()
+        kind = str(slide.get("kind") or "内容页").strip()
+        notes = str(slide.get("notes") or "").strip()
+        lines.append(f"{index}. {title}（{kind}）")
+        if purpose:
+            lines.append(f"   目标：{purpose}")
+        if notes:
+            lines.append(f"   讲解重点：{notes}")
+    if requirements:
+        lines.append("")
+        lines.append("需求补充：")
+        for label, key in (("使用场景", "scenario"), ("目标受众", "audience"), ("整体风格", "style"), ("核心目标", "objective")):
+            value = str(requirements.get(key) or "").strip()
+            if value:
+                lines.append(f"{label}：{value}")
+    return "\n".join(lines)
+
+
+def _refinement_history_prompt(messages: list[PageRefinementMessage]) -> str:
+    """Render a bounded page conversation for the next refinement task."""
+
+    if not messages:
+        return ""
+    lines = ["页面修改对话上下文（仅用于理解用户的连续要求，当前 PPT 文件是最终事实）："]
+    for message in messages[-6:]:
+        content = message.content.strip().replace("\x00", "")
+        if not content:
+            continue
+        content = content[:900]
+        label = "用户" if message.role == "user" else "助手"
+        lines.append(f"{label}：{content}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _page_count_for_range(value: object) -> int:
+    """Choose a deterministic target count inside the user's selected range."""
+
+    text = str(value or "8-10 页").strip()
+    match = re.search(r"(\d+)\s*[-至]\s*(\d+)", text)
+    if match:
+        return max(1, int(match.group(1)))
+    above = re.search(r"(\d+)\s*页以上", text)
+    return max(1, int(above.group(1))) if above else 8
+
+
+def _fallback_outline(topic: str, count: int) -> list[dict[str, str]]:
+    """Build a usable local outline when the configured model is unavailable."""
+
+    title = topic.strip() or "本次演示主题"
+    base = [
+        (title, "建立汇报主题、对象与核心主张", "封面页", "开场说明本次演示要解决的问题。"),
+        ("核心结论", "先给出观众需要记住的关键判断", "结论页", "用简洁语言说明结论与行动方向。"),
+        ("背景与关键挑战", "解释为什么现在需要关注这个议题", "问题分析", "补充必要背景，避免陷入细节。"),
+        ("现状与关键数据", "用事实建立对现状的共同认知", "数据图表", "说明数据来源与关键变化。"),
+        ("重点分析", "用结构化信息支撑判断", "分析页", "说明证据、洞察与影响。"),
+        ("方案设计", "说明可行路径与实施方法", "方案页", "把方案拆解成清晰步骤。"),
+        ("案例与落地参考", "用案例验证方案的可行性", "案例页", "提炼可复用的经验与边界。"),
+        ("价值与预期收益", "说明投入、收益和差异化价值", "价值页", "把价值转化成面向受众的收益。"),
+        ("实施计划", "明确节奏、责任与关键里程碑", "行动计划", "列出近期可执行的行动项。"),
+        ("风险与应对", "提前识别主要风险和缓解措施", "风险页", "说明风险等级与预案。"),
+        ("下一步行动", "明确需要决策和支持的事项", "行动计划", "以明确的行动项结束演示。"),
+    ]
+    items = base[:max(1, count)]
+    while len(items) < count:
+        number = len(items) - len(base) + 1
+        items.append((f"补充分析 {number:02d}", "补充支撑主题判断的关键信息", "内容页", "围绕主题补充必要信息。"))
+    return [
+        {"title": item[0], "purpose": item[1], "kind": item[2], "notes": item[3]}
+        for item in items
+    ]
+
+
+def _parse_outline_response(raw: str, topic: str, count: int) -> list[dict[str, str]]:
+    """Parse strict JSON or a JSON code block returned by an OpenAI-compatible model."""
+
+    candidate = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    start = candidate.find("[")
+    end = candidate.rfind("]")
+    if start < 0 or end <= start:
+        raise ValueError("模型未返回 JSON 大纲")
+    decoded = json.loads(candidate[start : end + 1])
+    if not isinstance(decoded, list):
+        raise ValueError("模型返回的大纲不是数组")
+    valid: list[dict[str, str]] = []
+    for item in decoded:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        valid.append({
+            "title": title[:160],
+            "purpose": str(item.get("purpose") or "").strip()[:500],
+            "kind": str(item.get("kind") or "内容页").strip()[:64],
+            "notes": str(item.get("notes") or "").strip()[:2_000],
+        })
+    if not valid:
+        raise ValueError("模型返回了空大纲")
+    valid[0]["title"] = topic[:160]
+    fallback = _fallback_outline(topic, count)
+    return (valid[:count] + fallback[len(valid):count])[:count]
+
+
+def _provider_request(
+    provider_url: str,
+    api_key: str,
+    model_id: str,
+    prompt: str,
+    system_prompt: str = "你是专业的演示文稿策划师，只返回严格 JSON 数组，不要 Markdown。",
+) -> str:
+    """Perform one bounded OpenAI-compatible request without adding a runtime dependency."""
+
+    endpoint = provider_url.rstrip("/") + "/chat/completions"
+    body = json.dumps({
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "stream": False,
+    }).encode("utf-8")
+    request = UrlRequest(endpoint, data=body, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }, method="POST")
+    with urlopen(request, timeout=45) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content"))
+    if not isinstance(content, str):
+        raise ValueError("模型响应缺少 content")
+    return content
+
+
+async def _active_model_credentials(db: AsyncSession) -> tuple[str, str, str] | None:
+    """Resolve the administrator-selected model without exposing provider secrets."""
+
+    active = next((item for item in await _model_catalog(db) if item.is_available and item.is_default), None)
+    if not active:
+        return None
+    model_id = active.model_id
+    provider_slug, _, raw_model = model_id.partition("/")
+    if provider_slug in {"aihub", "deepseek"}:
+        api_key = (settings.aihub_api_key if provider_slug == "aihub" else settings.deepseek_api_key) or None
+        provider_url = "https://aihub.dog/v1" if provider_slug == "aihub" else "https://api.deepseek.com"
+        return (provider_url, api_key, raw_model) if api_key else None
+    managed = (
+        await db.execute(
+            select(Provider, ProviderModel)
+            .join(ProviderModel, ProviderModel.provider_id == Provider.id)
+            .where(
+                Provider.slug == provider_slug,
+                ProviderModel.model_id == raw_model,
+                Provider.is_active.is_(True),
+                ProviderModel.is_active.is_(True),
+            )
+            .limit(1)
+        )
+    ).first()
+    if not managed:
+        return None
+    provider, provider_model = managed
+    try:
+        api_key = decrypt_api_key(provider.api_key_ciphertext)
+    except (HTTPException, RuntimeError) as exc:
+        logger.warning("Managed model provider is unavailable: %s", exc)
+        return None
+    return provider.base_url, api_key, provider_model.model_id
+
+
+async def _generate_outline_with_model(db: AsyncSession, requirements: dict, count: int) -> tuple[list[dict[str, str]], bool]:
+    """Generate an outline and report whether the model path was used."""
+
+    topic = str(requirements.get("topic") or "本次演示主题").strip()
+    prompt = (
+        f"请为主题“{topic}”设计恰好 {count} 页演示文稿大纲。\n"
+        f"页数范围：{requirements.get('page_range') or '未指定'}。\n"
+        f"使用场景：{requirements.get('scenario') or '业务汇报'}；目标受众：{requirements.get('audience') or '相关决策者'}；"
+        f"整体风格：{requirements.get('style') or '专业、简洁'}；核心目标：{requirements.get('objective') or '讲清楚主题'}。\n"
+        "返回 JSON 数组，每项字段为 title、purpose、kind、notes；第一项必须是主题页，页面数量必须严格一致。"
+    )
+    credentials = await _active_model_credentials(db)
+    if not credentials:
+        return _fallback_outline(topic, count), False
+    provider_url, api_key, model_id = credentials
+    try:
+        raw = await asyncio.to_thread(_provider_request, provider_url, api_key, model_id, prompt)
+        return _parse_outline_response(raw, topic, count), True
+    except (OSError, URLError, TimeoutError, ValueError, json.JSONDecodeError, HTTPException, RuntimeError) as exc:
+        logger.warning("Outline model generation failed; using fallback: %s", exc)
+        return _fallback_outline(topic, count), False
+
+
+_REFINEMENT_OPERATION_WORDS = (
+    "修改", "调整", "改成", "改为", "换成", "替换", "删除", "删掉", "移除", "增加", "添加",
+    "补充", "缩小", "放大", "移动", "上移", "下移", "左移", "右移", "改色", "变成", "美化",
+    "重排", "对齐", "加粗", "减小", "增大",
+)
+_REFINEMENT_TARGET_WORDS = (
+    "标题", "文字", "文案", "内容", "图表", "图片", "页面", "这一页", "当前页", "布局", "颜色",
+    "字号", "字体", "背景", "元素", "图形", "位置", "间距", "段落", "表格",
+)
+
+
+def _refinement_intent_fallback(message: str) -> dict[str, object]:
+    """Prevent unsafe PPT jobs when the conversation model is unavailable."""
+
+    text = message.strip()
+    has_operation = any(word in text for word in _REFINEMENT_OPERATION_WORDS)
+    has_target = any(word in text for word in _REFINEMENT_TARGET_WORDS)
+    if has_operation and has_target:
+        return {"action": "modify_current_slide", "confidence": 0.9, "normalized_request": text}
+    if has_operation:
+        return {
+            "action": "ask_clarification",
+            "confidence": 0.65,
+            "clarification_question": "你希望修改当前页的哪一部分？请说明对象和期望效果。",
+        }
+    return {
+        "action": "answer_only",
+        "confidence": 0.2,
+        "reply": "当前 AI 对话模型暂时不可用，暂不能完成自然对话；如需修改当前页，请描述具体对象和调整方式。",
+    }
+
+
+def _parse_refinement_intent_response(raw: str, message: str) -> dict[str, object]:
+    """Parse and constrain the classifier's strict JSON response."""
+
+    candidate = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("模型未返回 JSON 意图")
+    decoded = json.loads(candidate[start : end + 1])
+    if not isinstance(decoded, dict):
+        raise ValueError("模型返回的意图不是对象")
+    action = str(decoded.get("action") or "").strip()
+    if action not in {"modify_current_slide", "ask_clarification", "answer_only", "unsupported"}:
+        raise ValueError("模型返回了未知意图")
+    try:
+        confidence = min(1.0, max(0.0, float(decoded.get("confidence", 0))))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    normalized = str(decoded.get("normalized_request") or message).strip()[:4_000]
+    reply = str(decoded.get("reply") or "").strip()[:800]
+    question = str(decoded.get("clarification_question") or "").strip()[:800]
+    if action == "modify_current_slide" and confidence < 0.8:
+        action = "ask_clarification"
+        question = question or "我不太确定你的修改目标。请说明要调整的页面元素和期望效果。"
+    if action == "ask_clarification" and not question:
+        question = "你希望修改当前页的哪一部分？请说明对象和期望效果。"
+    if action == "answer_only" and not reply:
+        reply = "我可以帮你讨论当前页面，也可以根据明确要求提交 PPT 修改。"
+    if action == "unsupported" and not reply:
+        reply = "当前 AI 页面助手只负责修改选中的这一页，请描述具体的页面调整要求。"
+    return {
+        "action": action,
+        "confidence": confidence,
+        "normalized_request": normalized,
+        "reply": reply,
+        "clarification_question": question,
+    }
+
+
+async def _classify_refinement_intent(
+    db: AsyncSession,
+    slide_title: str,
+    message: str,
+    history: list[PageRefinementMessage],
+) -> dict[str, object]:
+    """Route every page-chat message through the model when it is available."""
+
+    fallback = _refinement_intent_fallback(message)
+    credentials = await _active_model_credentials(db)
+    if not credentials:
+        return fallback
+    history_prompt = _refinement_history_prompt(history)
+    prompt = (
+        "你是当前 PPT 页面助手，负责理解用户意图并进行自然对话。\n"
+        "每一条输入都必须先进行语义判断，不要因为命中关键词就机械分类。你只负责意图路由和回复，不要执行 PPT 修改。\n"
+        f"当前页面：{slide_title.strip()[:200]}\n"
+        f"{history_prompt}\n"
+        f"本轮用户输入：{message.strip()[:4_000]}\n\n"
+        "action 只能是："
+        "modify_current_slide（明确要求修改当前选中的这一页）、"
+        "ask_clarification（可能想修改，但对象、范围或效果不清楚）、"
+        "answer_only（问候、身份问题、功能咨询、闲聊或普通问题）、"
+        "unsupported（要求修改其他页面、导出文件、管理项目或超出当前页助手能力）。"
+        "只有用户明确表达页面修改目标和操作时，才能使用 modify_current_slide；"
+        "不能因为用户提到 PPT、页面或某个元素就直接创建修改任务。"
+        "对 answer_only 和 unsupported，reply 必须是结合当前助手身份和上下文生成的自然中文回复，"
+        "不能声称已经修改或提交任务；对 ask_clarification，clarification_question 要明确追问缺失信息。"
+        "confidence 为 0 到 1 的数字。只返回严格 JSON 对象，不要 Markdown。"
+        "返回字段：action、confidence、normalized_request、reply、clarification_question。"
+    )
+    provider_url, api_key, model_id = credentials
+    try:
+        raw = await asyncio.to_thread(
+            _provider_request,
+            provider_url,
+            api_key,
+            model_id,
+            prompt,
+            "你是当前 PPT 页面助手。请先理解语义，再决定是否需要修改当前页；对普通对话要自然回答。只返回严格 JSON 对象，不执行任何 PPT 修改。",
+        )
+        return _parse_refinement_intent_response(raw, message)
+    except (OSError, URLError, TimeoutError, ValueError, json.JSONDecodeError, HTTPException, RuntimeError) as exc:
+        logger.warning("Refinement intent classification failed; using fallback: %s", exc)
+        return fallback
 
 
 def _provider_out(provider: Provider, models: list[ProviderModel]) -> ProviderOut:
@@ -288,11 +671,52 @@ def _project_out(project: Project) -> ProjectOut:
     )
 
 
+def _material_out(material: ProjectMaterial) -> ProjectMaterialOut:
+    return ProjectMaterialOut(
+        id=material.id,
+        original_filename=material.original_filename,
+        content_type=material.content_type,
+        size_bytes=material.size_bytes,
+        status=material.status,
+        metadata=material.meta or {},
+        error=material.error,
+        created_at=material.created_at,
+        updated_at=material.updated_at,
+    )
+
+
+_MATERIAL_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".csv", ".txt", ".md", ".markdown", ".png", ".jpg", ".jpeg", ".webp"}
+_MATERIAL_MAX_BYTES = 100 * 1024 * 1024
+
+
+def _material_path(project: Project, material: ProjectMaterial) -> Path:
+    """Resolve a project material while preserving the project workspace boundary."""
+
+    root = _workspace_path(project)
+    path = (root / material.relative_path).resolve()
+    if root not in path.parents:
+        raise RuntimeError("Project material is outside WORKSPACE_ROOT")
+    return path
+
+
+def _material_prompt_context(materials: list[ProjectMaterial]) -> str:
+    """Build a bounded source manifest for the OpenCode generation prompt."""
+
+    if not materials:
+        return ""
+    lines = ["", "项目已上传以下创作材料。生成前请先读取材料清单，并将其作为事实来源；不要修改原始材料：", "材料目录：materials/"]
+    for material in materials:
+        lines.append(f"- {material.original_filename}（{material.content_type}，{material.size_bytes} bytes，路径：{material.relative_path}）")
+    lines.append("若材料是 PDF、DOCX、PPTX 或表格，请使用可用的来源转换工具提取内容后再规划页面；图片作为参考附件使用。")
+    return "\n".join(lines)
+
+
 def _job_out(job: Job) -> JobOut:
     return JobOut(
         id=job.id,
         project_id=job.project_id,
         base_job_id=job.base_job_id,
+        target_slide_number=job.target_slide_number,
         template_id=job.template_id,
         template_name=job.template_name,
         status=job.status,
@@ -351,7 +775,7 @@ async def _bootstrap_admin() -> None:
                 email=email,
                 password_hash=hash_password(settings.admin_password),
                 display_name="Administrator",
-                role=UserRole.ADMIN,
+                role=UserRole.SUPER_ADMIN,
             )
         )
         await db.commit()
@@ -439,7 +863,7 @@ async def current_user(user: User = Depends(get_current_user)) -> UserOut:
 @app.post("/api/v1/invites", response_model=InviteOut, status_code=status.HTTP_201_CREATED)
 async def create_invitation(
     payload: InviteIn,
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_super_admin),
     db: AsyncSession = Depends(get_db),
 ) -> InviteOut:
     """Issue a one-time invitation token for a specific email address."""
@@ -503,7 +927,7 @@ async def register(payload: RegisterIn, db: AsyncSession = Depends(get_db)) -> U
 
 
 @app.get("/api/v1/admin/users", response_model=list[UserOut])
-async def admin_list_users(admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)) -> list[UserOut]:
+async def admin_list_users(admin: User = Depends(require_super_admin), db: AsyncSession = Depends(get_db)) -> list[UserOut]:
     """List accounts for the administrator console."""
 
     del admin
@@ -512,7 +936,7 @@ async def admin_list_users(admin: User = Depends(require_admin), db: AsyncSessio
 
 
 @app.post("/api/v1/admin/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-async def admin_create_user(payload: AdminUserCreateIn, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)) -> UserOut:
+async def admin_create_user(payload: AdminUserCreateIn, admin: User = Depends(require_super_admin), db: AsyncSession = Depends(get_db)) -> UserOut:
     """Create an account directly instead of issuing an invitation."""
 
     del admin
@@ -581,7 +1005,7 @@ async def _purge_deleted_user(target: User, db: AsyncSession) -> None:
 
 
 @app.patch("/api/v1/admin/users/{user_id}", response_model=UserOut)
-async def admin_update_user(user_id: UUID, payload: AdminUserUpdateIn, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)) -> UserOut:
+async def admin_update_user(user_id: UUID, payload: AdminUserUpdateIn, admin: User = Depends(require_super_admin), db: AsyncSession = Depends(get_db)) -> UserOut:
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "用户不存在")
@@ -596,7 +1020,7 @@ async def admin_update_user(user_id: UUID, payload: AdminUserUpdateIn, admin: Us
 
 
 @app.delete("/api/v1/admin/users/{user_id}", response_model=UserOut, status_code=status.HTTP_202_ACCEPTED)
-async def admin_delete_user(user_id: UUID, admin: User = Depends(require_admin), db: AsyncSession = Depends(get_db)) -> UserOut:
+async def admin_delete_user(user_id: UUID, admin: User = Depends(require_super_admin), db: AsyncSession = Depends(get_db)) -> UserOut:
     """Deactivate an account and request cancellation before deferred removal."""
 
     target = await db.get(User, user_id)
@@ -800,16 +1224,136 @@ async def create_project(
     return _project_out(project)
 
 
+@app.get("/api/v1/projects/{project_id}/materials", response_model=list[ProjectMaterialOut])
+async def list_project_materials(
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+) -> list[ProjectMaterialOut]:
+    """List source materials attached to one owned project."""
+
+    materials = (
+        await db.execute(
+            select(ProjectMaterial)
+            .where(ProjectMaterial.project_id == project.id)
+            .order_by(ProjectMaterial.created_at.asc())
+        )
+    ).scalars().all()
+    return [_material_out(material) for material in materials]
+
+
+@app.post("/api/v1/projects/{project_id}/materials", response_model=ProjectMaterialOut, status_code=status.HTTP_201_CREATED)
+async def upload_project_material(
+    file: UploadFile = File(...),
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+) -> ProjectMaterialOut:
+    """Store one source file in a project-local materials directory."""
+
+    original_filename = Path(file.filename or "material").name
+    suffix = Path(original_filename).suffix.lower()
+    if suffix not in _MATERIAL_EXTENSIONS:
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "暂不支持该材料格式，请上传 PDF、DOCX、PPTX、表格、文本或图片。")
+    material = ProjectMaterial(
+        project_id=project.id,
+        original_filename=original_filename[:255],
+        relative_path="pending",
+        content_type=(file.content_type or "application/octet-stream")[:255],
+        status="processing",
+        metadata={"extension": suffix, "parse_mode": "deferred"},
+    )
+    db.add(material)
+    await db.flush()
+    material.relative_path = f"materials/{material.id}{suffix}"
+    destination = _material_path(project, material)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+                if total > _MATERIAL_MAX_BYTES:
+                    raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "单个材料不能超过 100 MB。")
+                output.write(chunk)
+        if suffix == ".pptx":
+            try:
+                with zipfile.ZipFile(destination) as archive:
+                    names = set(archive.namelist())
+                    if "[Content_Types].xml" not in names or "ppt/presentation.xml" not in names:
+                        raise ValueError("不是有效的 PPTX 演示文稿")
+            except (zipfile.BadZipFile, OSError, ValueError) as exc:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"PPTX 材料无效：{exc}") from exc
+        material.size_bytes = total
+        material.status = "ready"
+        metadata = dict(material.meta or {})
+        metadata.update({"stored": True, "parse_message": "材料已保存，生成任务会在工作区内完成来源转换。"})
+        material.meta = metadata
+        project.updated_at = datetime.now(UTC)
+        await db.commit()
+        await db.refresh(material)
+        return _material_out(material)
+    except Exception:
+        await db.rollback()
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+
+@app.delete("/api/v1/projects/{project_id}/materials/{material_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_project_material(
+    material_id: UUID,
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Remove one source file from its owning project."""
+
+    material = (
+        await db.execute(
+            select(ProjectMaterial).where(ProjectMaterial.id == material_id, ProjectMaterial.project_id == project.id)
+        )
+    ).scalar_one_or_none()
+    if not material:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "材料不存在")
+    path = _material_path(project, material)
+    await db.delete(material)
+    project.updated_at = datetime.now(UTC)
+    await db.commit()
+    path.unlink(missing_ok=True)
+
+
+@app.get("/api/v1/projects/{project_id}/materials/{material_id}/download")
+async def download_project_material(
+    material_id: UUID,
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+):
+    """Download an authorized project material for inspection."""
+
+    material = (
+        await db.execute(
+            select(ProjectMaterial).where(ProjectMaterial.id == material_id, ProjectMaterial.project_id == project.id)
+        )
+    ).scalar_one_or_none()
+    if not material:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "材料不存在")
+    path = _material_path(project, material)
+    if not path.is_file():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "材料文件不存在")
+    return FileResponse(path, media_type=material.content_type, filename=material.original_filename)
+
+
 @app.get("/api/v1/templates", response_model=list[TemplateOut])
 async def list_templates(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[TemplateOut]:
-    """List the authenticated user's imported templates."""
+    """List personal templates plus active platform templates."""
 
     templates = (
         await db.execute(
-            select(Template).where(Template.owner_id == user.id).order_by(Template.updated_at.desc())
+            select(Template)
+            .where(or_(Template.owner_id == user.id, and_(Template.scope == "system", Template.is_active.is_(True))))
+            .order_by(Template.scope.desc(), Template.sort_order, Template.updated_at.desc())
         )
     ).scalars().all()
     return [_template_out(template) for template in templates]
@@ -870,12 +1414,95 @@ async def import_template(
     return _template_out(template)
 
 
+@app.get("/api/v1/admin/system-templates", response_model=list[TemplateOut])
+async def admin_list_system_templates(
+    admin: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> list[TemplateOut]:
+    """List platform templates, including disabled entries."""
+
+    del admin
+    templates = (await db.execute(select(Template).where(Template.scope == "system").order_by(Template.sort_order, Template.updated_at.desc()))).scalars().all()
+    return [_template_out(template) for template in templates]
+
+
+@app.post("/api/v1/admin/system-templates/import", response_model=TemplateOut, status_code=status.HTTP_202_ACCEPTED)
+async def admin_import_system_template(
+    file: UploadFile = File(...),
+    admin: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> TemplateOut:
+    """Import a PPTX into the shared template library through the normal parser."""
+
+    created = await import_template(file, admin, db)
+    template = await db.get(Template, created.id)
+    if template is None:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "系统模板创建失败")
+    template.scope = "system"
+    template.is_active = True
+    await db.commit()
+    await db.refresh(template)
+    return _template_out(template)
+
+
+@app.patch("/api/v1/admin/system-templates/{template_id}", response_model=TemplateOut)
+async def admin_update_system_template(
+    template_id: UUID,
+    payload: AdminTemplateUpdateIn,
+    admin: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> TemplateOut:
+    """Update the visible name, ordering, and availability of a system template."""
+
+    del admin
+    template = (await db.execute(select(Template).where(Template.id == template_id, Template.scope == "system"))).scalar_one_or_none()
+    if not template:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "系统模板不存在")
+    if payload.name is not None:
+        template.name = payload.name.strip()
+    if payload.is_active is not None:
+        template.is_active = payload.is_active
+    if payload.sort_order is not None:
+        template.sort_order = payload.sort_order
+    await db.commit()
+    await db.refresh(template)
+    return _template_out(template)
+
+
+@app.delete("/api/v1/admin/system-templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def admin_delete_system_template(
+    template_id: UUID,
+    admin: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Remove a platform template without modifying prior project records."""
+
+    del admin
+    template = (await db.execute(select(Template).where(Template.id == template_id, Template.scope == "system"))).scalar_one_or_none()
+    if not template:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "系统模板不存在")
+    workspace = _template_workspace_path(template)
+    await db.delete(template)
+    await db.commit()
+    shutil.rmtree(workspace, ignore_errors=True)
+
+
 async def _get_owned_template(template_id: UUID, user: User, db: AsyncSession) -> Template:
     template = (
-        await db.execute(select(Template).where(Template.id == template_id, Template.owner_id == user.id))
+        await db.execute(select(Template).where(
+            Template.id == template_id,
+            or_(Template.owner_id == user.id, and_(Template.scope == "system", Template.is_active.is_(True))),
+        ))
     ).scalar_one_or_none()
     if not template:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "模板不存在")
+    return template
+
+
+async def _get_personal_template(template_id: UUID, user: User, db: AsyncSession) -> Template:
+    template = (await db.execute(select(Template).where(Template.id == template_id, Template.owner_id == user.id, Template.scope == "user"))).scalar_one_or_none()
+    if not template:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "个人模板不存在")
     return template
 
 
@@ -886,7 +1513,7 @@ async def download_template_file(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Serve a preview or source file from an owned import workspace."""
+    """Serve a preview or source file from an authorized template workspace."""
 
     template = await _get_owned_template(template_id, user, db)
     root = _template_workspace_path(template)
@@ -905,7 +1532,7 @@ async def retry_template_import(
 ) -> TemplateOut:
     """Requeue an interrupted template import and reset its visible progress."""
 
-    template = await _get_owned_template(template_id, user, db)
+    template = await _get_personal_template(template_id, user, db)
     metadata = dict(template.meta or {})
     metadata["progress"] = {
         "stage": "queued",
@@ -924,6 +1551,22 @@ async def retry_template_import(
     return _template_out(template)
 
 
+@app.patch("/api/v1/templates/{template_id}", response_model=TemplateOut)
+async def rename_template(
+    template_id: UUID,
+    payload: TemplateRenameIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TemplateOut:
+    """Rename one personal template without changing its imported files."""
+
+    template = await _get_personal_template(template_id, user, db)
+    template.name = payload.name.strip()
+    await db.commit()
+    await db.refresh(template)
+    return _template_out(template)
+
+
 @app.delete("/api/v1/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_template(
     template_id: UUID,
@@ -932,7 +1575,7 @@ async def delete_template(
 ) -> None:
     """Delete one owned template and its imported files."""
 
-    template = await _get_owned_template(template_id, user, db)
+    template = await _get_personal_template(template_id, user, db)
     active_job = (
         await db.execute(
             select(Job.id)
@@ -956,11 +1599,342 @@ async def delete_template(
     shutil.rmtree(workspace, ignore_errors=True)
 
 
+async def _get_owned_prompt_snippet(
+    snippet_id: UUID,
+    user: User,
+    db: AsyncSession,
+) -> PromptSnippet:
+    """Load one saved prompt only when it belongs to the signed-in user."""
+
+    snippet = (
+        await db.execute(
+            select(PromptSnippet).where(
+                PromptSnippet.id == snippet_id,
+                PromptSnippet.owner_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not snippet:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "提示词不存在")
+    return snippet
+
+
+async def _get_visible_prompt_snippet(
+    snippet_id: UUID,
+    user: User,
+    db: AsyncSession,
+) -> PromptSnippet:
+    snippet = (
+        await db.execute(
+            select(PromptSnippet).where(
+                PromptSnippet.id == snippet_id,
+                or_(
+                    PromptSnippet.owner_id == user.id,
+                    and_(PromptSnippet.scope == "system", PromptSnippet.is_active.is_(True)),
+                ),
+            )
+        )
+    ).scalar_one_or_none()
+    if not snippet:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "提示词不存在")
+    return snippet
+
+
+@app.get("/api/v1/prompt-snippets", response_model=list[PromptSnippetOut])
+async def list_prompt_snippets(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[PromptSnippetOut]:
+    """List personal prompts plus active platform prompts."""
+
+    snippets = (
+        await db.execute(
+            select(PromptSnippet)
+            .where(
+                or_(
+                    PromptSnippet.owner_id == user.id,
+                    and_(PromptSnippet.scope == "system", PromptSnippet.is_active.is_(True)),
+                )
+            )
+            .order_by(PromptSnippet.scope.desc(), PromptSnippet.sort_order, PromptSnippet.updated_at.desc())
+        )
+    ).scalars().all()
+    return [_prompt_snippet_out(snippet) for snippet in snippets]
+
+
+@app.post(
+    "/api/v1/prompt-snippets",
+    response_model=PromptSnippetOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_prompt_snippet(
+    payload: PromptSnippetCreateIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PromptSnippetOut:
+    """Save a prompt for reuse in future presentation work."""
+
+    snippet = PromptSnippet(
+        owner_id=user.id,
+        name=payload.name.strip(),
+        content=payload.content.strip(),
+        category=payload.category.strip(),
+    )
+    db.add(snippet)
+    await db.commit()
+    await db.refresh(snippet)
+    return _prompt_snippet_out(snippet)
+
+
+@app.get("/api/v1/admin/system-prompts", response_model=list[PromptSnippetOut])
+async def admin_list_system_prompts(
+    admin: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> list[PromptSnippetOut]:
+    """List platform prompts, including disabled entries."""
+
+    del admin
+    snippets = (await db.execute(select(PromptSnippet).where(PromptSnippet.scope == "system").order_by(PromptSnippet.sort_order, PromptSnippet.updated_at.desc()))).scalars().all()
+    return [_prompt_snippet_out(snippet) for snippet in snippets]
+
+
+@app.post("/api/v1/admin/system-prompts", response_model=PromptSnippetOut, status_code=status.HTTP_201_CREATED)
+async def admin_create_system_prompt(
+    payload: AdminPromptSnippetCreateIn,
+    admin: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PromptSnippetOut:
+    """Create one reusable prompt visible to every active user."""
+
+    snippet = PromptSnippet(
+        owner_id=admin.id,
+        scope="system",
+        name=payload.name.strip(),
+        content=payload.content.strip(),
+        category=payload.category.strip(),
+        is_active=payload.is_active,
+        sort_order=payload.sort_order,
+    )
+    db.add(snippet)
+    await db.commit()
+    await db.refresh(snippet)
+    return _prompt_snippet_out(snippet)
+
+
+@app.patch("/api/v1/admin/system-prompts/{snippet_id}", response_model=PromptSnippetOut)
+async def admin_update_system_prompt(
+    snippet_id: UUID,
+    payload: AdminPromptSnippetUpdateIn,
+    admin: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PromptSnippetOut:
+    """Update a reusable prompt in the platform library."""
+
+    del admin
+    snippet = (await db.execute(select(PromptSnippet).where(PromptSnippet.id == snippet_id, PromptSnippet.scope == "system"))).scalar_one_or_none()
+    if not snippet:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "系统提示词不存在")
+    for field in ("name", "content", "category"):
+        value = getattr(payload, field)
+        if value is not None:
+            setattr(snippet, field, value.strip())
+    if payload.is_active is not None:
+        snippet.is_active = payload.is_active
+    if payload.sort_order is not None:
+        snippet.sort_order = payload.sort_order
+    await db.commit()
+    await db.refresh(snippet)
+    return _prompt_snippet_out(snippet)
+
+
+@app.delete("/api/v1/admin/system-prompts/{snippet_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def admin_delete_system_prompt(
+    snippet_id: UUID,
+    admin: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Delete one system prompt from the platform library."""
+
+    del admin
+    snippet = (await db.execute(select(PromptSnippet).where(PromptSnippet.id == snippet_id, PromptSnippet.scope == "system"))).scalar_one_or_none()
+    if not snippet:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "系统提示词不存在")
+    await db.delete(snippet)
+    await db.commit()
+
+
+@app.patch("/api/v1/prompt-snippets/{snippet_id}", response_model=PromptSnippetOut)
+async def update_prompt_snippet(
+    snippet_id: UUID,
+    payload: PromptSnippetUpdateIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PromptSnippetOut:
+    """Update one owned reusable prompt."""
+
+    snippet = await _get_owned_prompt_snippet(snippet_id, user, db)
+    if payload.name is not None:
+        snippet.name = payload.name.strip()
+    if payload.content is not None:
+        snippet.content = payload.content.strip()
+    if payload.category is not None:
+        snippet.category = payload.category.strip()
+    await db.commit()
+    await db.refresh(snippet)
+    return _prompt_snippet_out(snippet)
+
+
+@app.post("/api/v1/prompt-snippets/{snippet_id}/use", response_model=PromptSnippetOut)
+async def use_prompt_snippet(
+    snippet_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PromptSnippetOut:
+    """Record one prompt insertion without exposing another user's prompt."""
+
+    snippet = await _get_visible_prompt_snippet(snippet_id, user, db)
+    snippet.used_count += 1
+    await db.commit()
+    await db.refresh(snippet)
+    return _prompt_snippet_out(snippet)
+
+
+@app.delete("/api/v1/prompt-snippets/{snippet_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_prompt_snippet(
+    snippet_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Delete an owned saved prompt."""
+
+    snippet = await _get_owned_prompt_snippet(snippet_id, user, db)
+    await db.delete(snippet)
+    await db.commit()
+
+
 @app.get("/api/v1/projects/{project_id}", response_model=ProjectOut)
 async def get_project(project: Project = Depends(get_owned_project)) -> ProjectOut:
     """Return a project owned by the authenticated user."""
 
     return _project_out(project)
+
+
+@app.patch("/api/v1/projects/{project_id}", response_model=ProjectOut)
+async def update_project(
+    payload: ProjectUpdateIn,
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+) -> ProjectOut:
+    """Rename one project without affecting its jobs or artifacts."""
+
+    project.title = payload.title.strip()
+    project.updated_at = datetime.now(UTC)
+    await db.commit()
+    await db.refresh(project)
+    return _project_out(project)
+
+
+@app.post("/api/v1/projects/{project_id}/duplicate", response_model=ProjectOut, status_code=status.HTTP_201_CREATED)
+async def duplicate_project(
+    project: Project = Depends(get_owned_project),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ProjectOut:
+    """Create a new draft with copied creative inputs and no generated artifacts."""
+
+    duplicate = Project(owner_id=user.id, title=f"{project.title} - 副本"[:160], workspace_relpath="pending")
+    db.add(duplicate)
+    await db.flush()
+    duplicate.workspace_relpath = f"{user.id}/{duplicate.id}"
+    _workspace_path(duplicate).mkdir(parents=True, exist_ok=False)
+    state = await db.get(ProjectCreativeState, project.id)
+    if state:
+        db.add(
+            ProjectCreativeState(
+                project_id=duplicate.id,
+                stage=state.stage,
+                requirements=dict(state.requirements or {}),
+                outline=list(state.outline or []),
+                notes_enabled=state.notes_enabled,
+                selected_template_id=state.selected_template_id,
+            )
+        )
+    await db.commit()
+    await db.refresh(duplicate)
+    return _project_out(duplicate)
+
+
+@app.get("/api/v1/projects/{project_id}/creative-state", response_model=ProjectCreativeStateOut)
+async def get_project_creative_state(
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+) -> ProjectCreativeStateOut:
+    """Return persisted requirements and outline, or a fresh workspace state."""
+
+    state = await db.get(ProjectCreativeState, project.id)
+    if state is None:
+        state = ProjectCreativeState(project_id=project.id)
+        db.add(state)
+        await db.commit()
+        await db.refresh(state)
+    return _creative_state_out(state)
+
+
+@app.put("/api/v1/projects/{project_id}/creative-state", response_model=ProjectCreativeStateOut)
+async def update_project_creative_state(
+    payload: ProjectCreativeStateUpdateIn,
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+) -> ProjectCreativeStateOut:
+    """Persist an explicitly confirmed requirement, outline, or template choice."""
+
+    state = await db.get(ProjectCreativeState, project.id)
+    if state is None:
+        state = ProjectCreativeState(project_id=project.id)
+        db.add(state)
+    if payload.stage is not None:
+        if payload.stage not in {"requirements", "outline", "template", "generating", "preview"}:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "未知的创作阶段")
+        state.stage = payload.stage
+    if payload.requirements is not None:
+        state.requirements = payload.requirements
+    if payload.outline is not None:
+        state.outline = [slide.model_dump() for slide in payload.outline]
+    if payload.notes_enabled is not None:
+        state.notes_enabled = payload.notes_enabled
+    if "selected_template_id" in payload.model_fields_set:
+        state.selected_template_id = payload.selected_template_id
+    project.updated_at = datetime.now(UTC)
+    await db.commit()
+    await db.refresh(state)
+    return _creative_state_out(state)
+
+
+@app.post("/api/v1/projects/{project_id}/creative-outline", response_model=ProjectCreativeStateOut)
+async def generate_project_creative_outline(
+    payload: ProjectCreativeOutlineIn,
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+) -> ProjectCreativeStateOut:
+    """Generate a page-count-aware outline, with a deterministic local fallback."""
+
+    state = await db.get(ProjectCreativeState, project.id)
+    if state is None:
+        state = ProjectCreativeState(project_id=project.id)
+        db.add(state)
+        await db.flush()
+    if payload.requirements is not None:
+        state.requirements = payload.requirements
+    requirements = dict(state.requirements or {})
+    topic = str(requirements.get("topic") or project.title).strip()
+    count = _page_count_for_range(requirements.get("page_range"))
+    outline, _ = await _generate_outline_with_model(db, requirements, count)
+    state.outline = outline
+    state.stage = "outline"
+    project.updated_at = datetime.now(UTC)
+    await db.commit()
+    await db.refresh(state)
+    return _creative_state_out(state)
 
 
 @app.delete("/api/v1/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1046,14 +2020,35 @@ async def create_job(
             status.HTTP_409_CONFLICT,
             "当前对话仍有任务在执行，请等待完成后再继续修改。",
         )
-    base_job = (
-        await db.execute(
-            select(Job)
-            .where(Job.project_id == locked_project.id, Job.status == JobStatus.SUCCEEDED)
-            .order_by(Job.finished_at.desc(), Job.created_at.desc())
-            .limit(1)
+    if payload.base_job_id:
+        base_job = (
+            await db.execute(
+                select(Job).where(
+                    Job.id == payload.base_job_id,
+                    Job.project_id == locked_project.id,
+                    Job.status.in_([JobStatus.SUCCEEDED, JobStatus.FAILED]),
+                )
+            )
+        ).scalar_one_or_none()
+        if not base_job:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "要继续的任务不存在、尚未结束或不属于当前项目。",
+            )
+    else:
+        base_job = (
+            await db.execute(
+                select(Job)
+                .where(Job.project_id == locked_project.id, Job.status == JobStatus.SUCCEEDED)
+                .order_by(Job.finished_at.desc(), Job.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if payload.target_slide_number is not None and base_job is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "页面精修必须基于当前已完成的演示文稿。",
         )
-    ).scalar_one_or_none()
     template: Template | None = None
     template_root: str | None = None
     if payload.template_id:
@@ -1066,7 +2061,7 @@ async def create_job(
             await db.execute(
                 select(Template).where(
                     Template.id == payload.template_id,
-                    Template.owner_id == user.id,
+                    or_(Template.owner_id == user.id, and_(Template.scope == "system", Template.is_active.is_(True))),
                     Template.status == TemplateStatus.READY.value,
                 )
             )
@@ -1076,25 +2071,187 @@ async def create_job(
         template_root = str((template.meta or {}).get("template_root") or "").strip()
         if not template_root:
             raise HTTPException(status.HTTP_409_CONFLICT, "所选模板缺少可用的模板工作区。")
+    creative_state = await db.get(ProjectCreativeState, locked_project.id)
+    job_prompt = _outline_prompt(payload.prompt.strip(), creative_state) if base_job is None else payload.prompt.strip()
+    if payload.target_slide_number is not None:
+        history_stmt = (
+            select(PageRefinementMessage)
+            .where(
+                PageRefinementMessage.project_id == locked_project.id,
+                PageRefinementMessage.slide_number == payload.target_slide_number,
+            )
+            .order_by(PageRefinementMessage.message_order.desc())
+            .limit(8)
+        )
+        history = list((await db.execute(history_stmt)).scalars().all())
+        history.reverse()
+        history_prompt = _refinement_history_prompt(history)
+        if history_prompt:
+            job_prompt = f"{job_prompt}\n\n{history_prompt}"
+    project_materials = (
+        await db.execute(
+            select(ProjectMaterial)
+            .where(ProjectMaterial.project_id == locked_project.id, ProjectMaterial.status == "ready")
+            .order_by(ProjectMaterial.created_at.asc())
+        )
+    ).scalars().all()
+    job_prompt = f"{job_prompt}{_material_prompt_context(project_materials)}"
+    if len(job_prompt) > 20_000:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "确认的大纲内容过长，请精简后再生成")
     job = Job(
         project_id=locked_project.id,
         base_job_id=base_job.id if base_job else None,
+        target_slide_number=payload.target_slide_number,
         template_id=template.id if template else None,
         template_name=template.name if template else None,
         template_workspace_relpath=template.workspace_relpath if template else None,
         template_root=template_root,
         submitted_by=user.id,
-        prompt=payload.prompt.strip(),
+        prompt=job_prompt,
         model=model,
     )
     locked_project.updated_at = datetime.now(UTC)
     db.add(job)
+    await db.flush()
+    if payload.target_slide_number is not None and payload.conversation_message:
+        db.add(
+            PageRefinementMessage(
+                project_id=locked_project.id,
+                job_id=job.id,
+                slide_number=payload.target_slide_number,
+                role="user",
+                content=payload.conversation_message.strip(),
+                client_message_id=payload.client_message_id,
+            )
+        )
     await db.commit()
     await db.refresh(job)
     from runner.celery_app import celery_app
 
     celery_app.send_task("runner.execute_job", args=[str(job.id)])
     return _job_out(job)
+
+
+@app.post(
+    "/api/v1/projects/{project_id}/refinement-intent",
+    response_model=PageRefinementIntentOut,
+)
+async def classify_refinement_intent(
+    payload: PageRefinementIntentIn,
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+) -> PageRefinementIntentOut:
+    """Classify a page-chat message before it can create a PPT modification job."""
+
+    if payload.client_message_id:
+        existing_user = (
+            await db.execute(
+                select(PageRefinementMessage)
+                .where(
+                    PageRefinementMessage.project_id == project.id,
+                    PageRefinementMessage.slide_number == payload.slide_number,
+                    PageRefinementMessage.client_message_id == payload.client_message_id,
+                    PageRefinementMessage.role == "user",
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing_user:
+            existing_reply = (
+                await db.execute(
+                    select(PageRefinementMessage)
+                    .where(
+                    PageRefinementMessage.project_id == project.id,
+                    PageRefinementMessage.slide_number == payload.slide_number,
+                    PageRefinementMessage.message_order > existing_user.message_order,
+                    PageRefinementMessage.role == "assistant",
+                )
+                    .order_by(PageRefinementMessage.message_order)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return PageRefinementIntentOut(
+                action="answer_only",
+                confidence=1,
+                normalized_request=payload.message.strip(),
+                reply=existing_reply.content if existing_reply else "这条消息已经收到。",
+            )
+
+    history_stmt = (
+        select(PageRefinementMessage)
+        .where(
+            PageRefinementMessage.project_id == project.id,
+            PageRefinementMessage.slide_number == payload.slide_number,
+        )
+        .order_by(PageRefinementMessage.message_order.desc())
+        .limit(6)
+    )
+    history = list((await db.execute(history_stmt)).scalars().all())
+    history.reverse()
+    result = await _classify_refinement_intent(db, payload.slide_title, payload.message, history)
+    action = str(result.get("action") or "answer_only")
+    reply = str(result.get("reply") or "").strip()
+    question = str(result.get("clarification_question") or "").strip()
+    assistant_content = reply if action in {"answer_only", "unsupported"} else question
+    if action != "modify_current_slide":
+        db.add(PageRefinementMessage(
+            project_id=project.id,
+            slide_number=payload.slide_number,
+            role="user",
+            content=payload.message.strip(),
+            client_message_id=payload.client_message_id,
+        ))
+        await db.flush()
+        db.add(PageRefinementMessage(
+            project_id=project.id,
+            slide_number=payload.slide_number,
+            role="assistant",
+            content=assistant_content or "请说明你想如何修改当前页面。",
+        ))
+        await db.commit()
+    return PageRefinementIntentOut(
+        action=action,
+        confidence=float(result.get("confidence") or 0),
+        normalized_request=str(result.get("normalized_request") or payload.message).strip(),
+        reply=reply,
+        clarification_question=question,
+    )
+
+
+@app.get(
+    "/api/v1/projects/{project_id}/refinement-messages",
+    response_model=list[PageRefinementMessageOut],
+)
+async def list_refinement_messages(
+    slide_number: int,
+    project: Project = Depends(get_owned_project),
+    db: AsyncSession = Depends(get_db),
+) -> list[PageRefinementMessageOut]:
+    """Return the persisted AI conversation for one project page."""
+
+    if slide_number < 1 or slide_number > 999:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "页面编号无效")
+    stmt = (
+        select(PageRefinementMessage)
+        .where(
+            PageRefinementMessage.project_id == project.id,
+            PageRefinementMessage.slide_number == slide_number,
+        )
+        .order_by(PageRefinementMessage.message_order)
+    )
+    messages = (await db.execute(stmt)).scalars().all()
+    return [
+        PageRefinementMessageOut(
+            id=message.id,
+            job_id=message.job_id,
+            slide_number=message.slide_number,
+            role=message.role,
+            content=message.content,
+            message_order=message.message_order,
+            created_at=message.created_at,
+        )
+        for message in messages
+    ]
 
 
 @app.get("/api/v1/models", response_model=list[ModelOut])

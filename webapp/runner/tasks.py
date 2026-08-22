@@ -26,7 +26,9 @@ from api.models import (
     Job,
     JobEvent,
     JobStatus,
+    PageRefinementMessage,
     Project,
+    ProjectMaterial,
     Provider,
     ProviderModel,
     Template,
@@ -258,6 +260,24 @@ def _seed_job_workspace(project: Project, job: Job, destination: Path) -> bool:
     return True
 
 
+def _copy_project_materials(project: Project, destination: Path) -> None:
+    """Copy immutable project source materials into the isolated worker mount."""
+
+    project_root = _project_workspace_path(project)
+    materials_root = (project_root / "materials").resolve()
+    if project_root not in materials_root.parents or not materials_root.is_dir():
+        return
+    target_root = (destination / "materials").resolve()
+    if destination.resolve() not in target_root.parents:
+        raise RuntimeError("Material destination is outside the job workspace")
+    target_root.mkdir(parents=True, exist_ok=True)
+    for source in materials_root.iterdir():
+        if source.is_symlink() or not source.is_file():
+            continue
+        target = target_root / source.name
+        shutil.copy2(source, target)
+
+
 def _provider_environment() -> dict[str, str]:
     """Forward only explicitly allowlisted provider credentials to a job worker."""
 
@@ -287,6 +307,7 @@ def _load_job(job_id: UUID) -> tuple[Job, Project]:
             job.status = JobStatus.CANCELLED
             job.finished_at = datetime.now(UTC)
             db.add(JobEvent(job_id=job.id, event_type="status", payload={"status": "cancelled"}))
+            _record_refinement_result(db, job)
             db.commit()
             return job, project
         job.status = JobStatus.RUNNING
@@ -304,6 +325,31 @@ def _record_event(job_id: UUID, event: dict) -> None:
         db.commit()
 
 
+def _record_refinement_result(db, job: Job) -> None:
+    """Append one terminal assistant message for a page refinement job."""
+
+    if job.target_slide_number is None:
+        return
+    if job.status is JobStatus.SUCCEEDED:
+        content = "当前页面已修改完成，结果已应用到当前 PPT。你还可以继续告诉我需要调整的地方。"
+    elif job.status is JobStatus.CANCELLED:
+        content = "这次修改已中止，当前 PPT 没有变化。你可以继续发送新的修改要求。"
+    else:
+        detail = (job.error or "").strip()
+        content = "这次修改没有完成，当前 PPT 没有变化。你可以直接重试，或换一种方式描述修改要求。"
+        if detail:
+            content += f"失败原因：{detail[:800]}"
+    db.add(
+        PageRefinementMessage(
+            project_id=job.project_id,
+            job_id=job.id,
+            slide_number=job.target_slide_number,
+            role="assistant",
+            content=content,
+        )
+    )
+
+
 def _finish_job(job_id: UUID, succeeded: bool, error: str | None = None) -> None:
     """Persist terminal state and discover the job's exported artifacts."""
 
@@ -318,13 +364,20 @@ def _finish_job(job_id: UUID, succeeded: bool, error: str | None = None) -> None
         job.error = error
         job.finished_at = datetime.now(UTC)
         db.add(JobEvent(job_id=job.id, event_type="status", payload={"status": job.status.value}))
+        _record_refinement_result(db, job)
         project_workspace = _project_workspace_path(project)
         job_workspace = _job_workspace_path(project, job)
         _discover_job_artifacts(db, job, project, project_workspace, job_workspace)
         _grant_editor_write_access(job_workspace)
         owner_id = project.owner_id
         db.commit()
-    _finalize_pending_user_deletion(owner_id)
+    # Account cleanup is deliberately outside the job transaction. A stale
+    # runner image, enum mismatch, or filesystem issue must never rewrite a
+    # successfully exported job as failed after this commit has completed.
+    try:
+        _finalize_pending_user_deletion(owner_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Post-job user cleanup failed for owner %s", owner_id)
 
 
 def _discover_job_artifacts(
@@ -440,7 +493,10 @@ def execute_job(self, job_id_text: str) -> None:
     job_id = UUID(job_id_text)
     job, project = _load_job(job_id)
     if job.status is JobStatus.CANCELLED:
-        _finalize_pending_user_deletion(project.owner_id)
+        try:
+            _finalize_pending_user_deletion(project.owner_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("Cancelled-job user cleanup failed for owner %s", project.owner_id)
         return
     worker_name = f"pptmaster-worker-{str(job.id)[:12]}"
     client = docker.from_env()
@@ -450,6 +506,7 @@ def execute_job(self, job_id_text: str) -> None:
         job_workspace = _prepare_job_workspace(project, job)
         template_workspace = _copy_template_snapshot(job, job_workspace)
         is_continuation = _seed_job_workspace(project, job, job_workspace)
+        _copy_project_materials(project, job_workspace)
         if is_continuation or template_workspace:
             _grant_worker_write_access(job_workspace)
         mounts = [
@@ -477,6 +534,8 @@ def execute_job(self, job_id_text: str) -> None:
             "PPTMASTER_OPENCODE_IDLE_TIMEOUT_SECONDS": str(settings.opencode_idle_timeout_seconds),
             **_provider_environment(),
         }
+        if job.target_slide_number is not None:
+            environment["PPTMASTER_TARGET_SLIDE"] = str(job.target_slide_number)
         if template_workspace:
             environment["PPTMASTER_TEMPLATE_ROOT"] = "/workspace/project/template"
         if generated_config:
